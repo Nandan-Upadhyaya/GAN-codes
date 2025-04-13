@@ -1,0 +1,7 @@
+images/
+test/
+train/
+bounding_boxes.txt
+images.txt
+char-CNN-RNN-embeddings.pickle
+
