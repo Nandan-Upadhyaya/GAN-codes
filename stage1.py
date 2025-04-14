@@ -53,8 +53,8 @@ class Config:
     BIRDS_TRAIN_TEST_URL = "https://github.com/hanzhanggit/StackGAN/raw/master/Data/birds/train-test-split.pickle"
 
     # Memory management
-    SHUFFLE_BUFFER_SIZE = 4000  # Increased from 1000 to better utilize RAM
-    PREFETCH_BUFFER_SIZE = 12    # Increased from 2 to improve pipeline efficiency
+    SHUFFLE_BUFFER_SIZE = 4000  # Keep at moderate size for good randomization
+    PREFETCH_BUFFER_SIZE = 100    # Increased from 12 to dramatically improve pipeline efficiency
 
 def download_and_prepare_dataset(config):
     """Use the local dataset without downloading anything"""
@@ -206,7 +206,7 @@ class Dataset:
                         yield image, embedding_arr
                         
                         # Print progress occasionally
-                        if (i+1) % 100 == 0:
+                        if (i+1) % 1000 == 0:
                             print(f"Streamed {i+1}/{self.dataset_size} images")
                             
                     except Exception as e:
@@ -242,6 +242,127 @@ class Dataset:
         dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
         
         return dataset, estimated_size
+
+    def get_test_data(self):
+        """Return a TensorFlow dataset for testing/validation"""
+        print("Setting up test data streaming pipeline...")
+        
+        # Load test embeddings and filenames
+        test_embedding_path = os.path.join(self.test_dir, 'char-CNN-RNN-embeddings.pickle')
+        test_filenames_path = os.path.join(self.test_dir, 'filenames.pickle')
+        
+        # Verify files exist
+        if not os.path.exists(test_embedding_path):
+            raise FileNotFoundError(f"Test embeddings file not found: {test_embedding_path}")
+        if not os.path.exists(test_filenames_path):
+            raise FileNotFoundError(f"Test filenames file not found: {test_filenames_path}")
+            
+        # Load test text embeddings
+        with open(test_embedding_path, 'rb') as f:
+            test_embeddings = pickle.load(f, encoding='latin1')
+        # Load test filenames
+        with open(test_filenames_path, 'rb') as f:
+            test_filenames = pickle.load(f, encoding='latin1')
+        test_dataset_size = len(test_filenames)
+        print(f"Test dataset size: {test_dataset_size}")
+        
+        # Check embeddings format
+        is_embeddings_list = isinstance(test_embeddings, list)
+        if is_embeddings_list:
+            print("Detected test embeddings as a list structure.")
+            
+            # Create a generator function for test data
+            def test_data_generator():
+                for i, filename in enumerate(test_filenames):
+                    if i >= len(test_embeddings):
+                        continue
+                        
+                    try:
+                        image = self.load_image(filename)
+                        embedding = test_embeddings[i]
+                        
+                        # Handle 3D embeddings - flatten to 2D
+                        embedding_arr = np.array(embedding)
+                        if len(embedding_arr.shape) > 2:
+                            embedding_arr = embedding_arr.flatten()
+                        
+                        yield image, embedding_arr
+                        
+                    except Exception as e:
+                        print(f"Error loading test image {filename}: {e}")
+            
+            # Create output signature for the dataset
+            sample_embedding_arr = np.array(test_embeddings[0])
+            if len(sample_embedding_arr.shape) > 2:
+                emb_shape = sample_embedding_arr.size
+                embedding_shape = tf.TensorShape([emb_shape])
+            else:
+                embedding_shape = tf.TensorShape(sample_embedding_arr.shape)
+            
+            # Create TensorFlow dataset from generator
+            test_dataset = tf.data.Dataset.from_generator(
+                test_data_generator,
+                output_signature=(
+                    tf.TensorSpec(shape=(self.image_size, self.image_size, 3), dtype=tf.float32),
+                    tf.TensorSpec(shape=embedding_shape, dtype=tf.float32)
+                )
+            )
+            
+            # Estimate dataset size
+            estimated_size = min(len(test_filenames), len(test_embeddings))
+        else:
+            # Dictionary-based embeddings
+            raise ValueError("Dictionary-based embeddings not implemented yet")
+        
+        # Apply dataset transformations - no shuffling for validation
+        test_dataset = test_dataset.batch(self.config.BATCH_SIZE, drop_remainder=True)
+        test_dataset = test_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        
+        return test_dataset, estimated_size
+
+    def visualize_samples(self, num_samples=3):
+        """Visualize a few samples to verify text-image pairs"""
+        print("Visualizing sample text-image pairs for verification...")
+        
+        for i, (filename, embedding) in enumerate(zip(self.filenames[:num_samples], self.embeddings[:num_samples])):
+            try:
+                # Load and display image
+                img = self.load_image(filename)
+                plt.figure(figsize=(8, 4))
+                
+                # Image display
+                plt.subplot(1, 2, 1)
+                plt.imshow((img + 1) / 2.0)  # Convert from [-1,1] to [0,1]
+                plt.title(f"Image: {filename}")
+                plt.axis('off')
+                
+                # Embedding visualization (show first 20 values of flattened array)
+                plt.subplot(1, 2, 2)
+                embedding_arr = np.array(embedding)
+                
+                # Reshape embedding - this is the key fix
+                if len(embedding_arr.shape) > 1:
+                    # For 2D embeddings (sequence, features), take mean across sequence
+                    # or just use the first 20 values of flattened array
+                    flat_embedding = embedding_arr.flatten()
+                    # Use the first 20 elements
+                    embedding_values = flat_embedding[:20]
+                else:
+                    embedding_values = embedding_arr[:20]
+                
+                plt.bar(range(len(embedding_values)), embedding_values)
+                plt.title(f"First 20 embedding values\nShape: {embedding_arr.shape}")
+                
+                plt.tight_layout()
+                plt.savefig(f"sample_pair_{i}.png")
+                plt.close()
+                
+                print(f"Sample {i+1}: Image shape {img.shape}, Embedding shape {embedding_arr.shape}")
+                
+            except Exception as e:
+                print(f"Error visualizing sample {i}: {e}")
+                
+        print("Sample visualizations saved as sample_pair_X.png files")
 
 def save_images(images, path):
     """Save images to a single figure"""
@@ -286,6 +407,24 @@ class Stage1Trainer:
         )
         # Create fixed noise vector for visualization
         self.fixed_noise = tf.random.normal([config.NUM_EXAMPLES, config.Z_DIM])
+        
+        # Initialize metrics tracking
+        self.metrics = {
+            'train': {
+                'g_losses': [],
+                'd_losses': [],
+                'kl_losses': []
+            },
+            'val': {
+                'g_losses': [],
+                'd_losses': [],
+                'kl_losses': []
+            }
+        }
+        
+        # Create log directory
+        self.log_dir = os.path.join('logs', config.DATASET_NAME)
+        os.makedirs(self.log_dir, exist_ok=True)
 
     @tf.function
     def train_generator(self, embeddings, noise):
@@ -338,6 +477,73 @@ class Stage1Trainer:
         self.d_optimizer.apply_gradients(zip(gradients, self.discriminator.trainable_variables))
         return d_loss
 
+    @tf.function
+    def calculate_losses(self, real_images, embeddings, noise, training=True):
+        """Calculate losses without updating weights (for validation)"""
+        # Ensure embeddings have the right shape (should be 2D)
+        if len(embeddings.shape) > 2:
+            embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
+            
+        # Generate fake images
+        fake_images, kl_loss = self.generator([noise, embeddings], training=False)  # training=False prevents BatchNorm updates
+        
+        # Compute discriminator outputs
+        real_logits = self.discriminator([real_images, embeddings], training=False)  # training=False here too
+        fake_logits = self.discriminator([fake_images, embeddings], training=False)
+        
+        # Calculate losses the same way as in training for consistent measurement
+        g_loss = -tf.reduce_mean(fake_logits)
+        total_g_loss = g_loss + self.config.LAMBDA * kl_loss
+        
+        d_loss_real = -tf.reduce_mean(real_logits)
+        d_loss_fake = tf.reduce_mean(fake_logits)
+        d_loss = d_loss_real + d_loss_fake
+        
+        return {
+            'g_loss': g_loss,
+            'd_loss': d_loss,
+            'kl_loss': kl_loss,
+            'total_g_loss': total_g_loss
+        }
+
+    def validate(self, val_dataset):
+        """Validate the model on the validation dataset"""
+        print("Running validation...")
+        g_losses = []
+        d_losses = []
+        kl_losses = []
+        
+        for step, (real_images, embeddings) in enumerate(val_dataset):
+            batch_size = real_images.shape[0]
+            noise = tf.random.normal([batch_size, self.config.Z_DIM])
+            
+            # Calculate losses without updating weights
+            losses = self.calculate_losses(real_images, embeddings, noise, training=False)
+            
+            g_losses.append(losses['g_loss'])
+            d_losses.append(losses['d_loss'])
+            kl_losses.append(losses['kl_loss'])
+            
+            if (step + 1) % 5 == 0:
+                print(f"  Validation Step {step+1}, "
+                      f"G Loss: {losses['g_loss']:.4f}, D Loss: {losses['d_loss']:.4f}, "
+                      f"KL Loss: {losses['kl_loss']:.4f}")
+        
+        # Calculate averages
+        avg_g_loss = tf.reduce_mean(g_losses).numpy()
+        avg_d_loss = tf.reduce_mean(d_losses).numpy()
+        avg_kl_loss = tf.reduce_mean(kl_losses).numpy()
+        
+        print(f"Validation Results: G Loss: {avg_g_loss:.4f}, "
+              f"D Loss: {avg_d_loss:.4f}, KL Loss: {avg_kl_loss:.4f}")
+              
+        # Store validation metrics
+        self.metrics['val']['g_losses'].append(avg_g_loss)
+        self.metrics['val']['d_losses'].append(avg_d_loss)
+        self.metrics['val']['kl_losses'].append(avg_kl_loss)
+        
+        return avg_g_loss, avg_d_loss, avg_kl_loss
+
     def save_samples(self, epoch, embeddings):
         # Ensure embeddings have the right shape
         if len(embeddings.shape) > 2:
@@ -349,14 +555,54 @@ class Stage1Trainer:
         save_path = os.path.join(self.sample_dir, f'stage1_epoch_{epoch}.png')
         save_images(fake_images, save_path)
 
-    def train(self, dataset, dataset_size):
-        steps_per_epoch = dataset_size // self.config.BATCH_SIZE
+    def plot_metrics(self, epoch):
+        """Plot training and validation metrics"""
+        epochs = list(range(1, epoch + 2))
+        
+        plt.figure(figsize=(15, 5))
+        
+        # Generator loss
+        plt.subplot(1, 3, 1)
+        plt.plot(epochs, self.metrics['train']['g_losses'], 'b-', label='Training')
+        plt.plot(epochs, self.metrics['val']['g_losses'], 'r-', label='Validation')
+        plt.title('Generator Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        # Discriminator loss
+        plt.subplot(1, 3, 2)
+        plt.plot(epochs, self.metrics['train']['d_losses'], 'b-', label='Training')
+        plt.plot(epochs, self.metrics['val']['d_losses'], 'r-', label='Validation')
+        plt.title('Discriminator Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        # KL loss
+        plt.subplot(1, 3, 3)
+        plt.plot(epochs, self.metrics['train']['kl_losses'], 'b-', label='Training')
+        plt.plot(epochs, self.metrics['val']['kl_losses'], 'r-', label='Validation')
+        plt.title('KL Divergence Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.log_dir, f'metrics_epoch_{epoch}.png'))
+        plt.close()
+
+    def train(self, train_dataset, val_dataset, train_size, val_size):
+        steps_per_epoch = train_size // self.config.BATCH_SIZE
         # Get fixed embeddings for visualization
-        for _, embeddings in dataset.take(1):
+        for _, embeddings in train_dataset.take(1):
             fixed_embeddings = embeddings[:self.config.NUM_EXAMPLES]
             # Ensure fixed embeddings have the right shape
             if len(fixed_embeddings.shape) > 2:
                 fixed_embeddings = tf.reshape(fixed_embeddings, [self.config.NUM_EXAMPLES, -1])
+                
+        # Remove initial validation - start directly with training
+        
         # Start training
         for epoch in range(self.config.EPOCHS):
             start_time = time.time()
@@ -364,7 +610,9 @@ class Stage1Trainer:
             g_losses = []
             d_losses = []
             kl_losses = []
-            for step, (real_images, embeddings) in enumerate(dataset):
+            
+            print(f"Epoch {epoch+1}/{self.config.EPOCHS} - Training:")
+            for step, (real_images, embeddings) in enumerate(train_dataset):
                 batch_size = real_images.shape[0]
                 # Generate random noise
                 noise = tf.random.normal([batch_size, self.config.Z_DIM])
@@ -378,24 +626,97 @@ class Stage1Trainer:
                 kl_losses.append(kl_loss)
                 # Print progress
                 if (step + 1) % 10 == 0:
-                    print(f"Epoch {epoch+1}/{self.config.EPOCHS}, "
-                          f"Step {step+1}/{steps_per_epoch}, "
+                    print(f"  Step {step+1}/{steps_per_epoch}, "
                           f"G Loss: {g_loss:.4f}, D Loss: {d_loss:.4f}, KL Loss: {kl_loss:.4f}")
+                          
             # Calculate epoch averages
-            g_loss_avg = sum(g_losses) / len(g_losses)
-            d_loss_avg = sum(d_losses) / len(d_losses)
-            kl_loss_avg = sum(kl_losses) / len(kl_losses)
-            # Print epoch summary
-            print(f"Epoch {epoch+1}/{self.config.EPOCHS}, "
+            g_loss_avg = tf.reduce_mean(g_losses).numpy()
+            d_loss_avg = tf.reduce_mean(d_losses).numpy()
+            kl_loss_avg = tf.reduce_mean(kl_losses).numpy()
+            
+            # Store training metrics
+            self.metrics['train']['g_losses'].append(g_loss_avg)
+            self.metrics['train']['d_losses'].append(d_loss_avg)
+            self.metrics['train']['kl_losses'].append(kl_loss_avg)
+            
+            # Print epoch training summary
+            train_time = time.time() - start_time
+            print(f"Epoch {epoch+1}/{self.config.EPOCHS} - Training Results: "
                   f"G Loss: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL Loss: {kl_loss_avg:.4f}, "
-                  f"Time: {time.time() - start_time:.2f}s")
-            # Save samples
-            if (epoch + 1) % self.config.SNAPSHOT_INTERVAL == 0:
-                self.save_samples(epoch + 1, fixed_embeddings)
+                  f"Time: {train_time:.2f}s")
+            
+            # Run validation
+            val_start_time = time.time()
+            print(f"Epoch {epoch+1}/{self.config.EPOCHS} - Validation:")
+            val_g_loss, val_d_loss, val_kl_loss = self.validate(val_dataset)
+            val_time = time.time() - val_start_time
+            
+            # Print combined summary
+            print(f"Epoch {epoch+1}/{self.config.EPOCHS} - Summary:")
+            print(f"  Training:   G Loss: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL Loss: {kl_loss_avg:.4f}")
+            print(f"  Validation: G Loss: {val_g_loss:.4f}, D Loss: {val_d_loss:.4f}, KL Loss: {val_kl_loss:.4f}")
+            print(f"  Time: Training {train_time:.2f}s, Validation {val_time:.2f}s, Total {train_time+val_time:.2f}s")
+            
+            # Plot metrics
+            self.plot_metrics(epoch)
+            
+            # Show text-to-image generation demonstration after each epoch
+            self.generate_text_to_image_demo(epoch + 1, fixed_embeddings, train_dataset)
+            
             # Save model
             if (epoch + 1) % self.config.SNAPSHOT_INTERVAL == 0:
                 save_model(self.generator, os.path.join(self.checkpoint_dir, f'stage1_generator_{epoch+1}'))
                 save_model(self.discriminator, os.path.join(self.checkpoint_dir, f'stage1_discriminator_{epoch+1}'))
+
+    def generate_text_to_image_demo(self, epoch, fixed_embeddings, train_dataset):
+        """Generate and save text-to-image demo after each epoch"""
+        print(f"Generating text-to-image demonstration for epoch {epoch}...")
+        
+        # Get random text embeddings and actual images from training data
+        demo_samples = []
+        for real_images, embeddings in train_dataset.take(1):
+            # Take first 3 samples from the batch
+            demo_samples = [(real_images[i].numpy(), embeddings[i].numpy()) for i in range(min(3, len(real_images)))]
+        
+        # Create a figure to display real and generated images side by side
+        plt.figure(figsize=(12, 4 * len(demo_samples)))
+        
+        for i, (real_image, embedding) in enumerate(demo_samples):
+            # Reshape embedding if needed
+            if len(embedding.shape) > 1:
+                embedding = embedding.flatten()
+            
+            # Add batch dimension
+            embedding_batch = tf.expand_dims(embedding, 0)
+            
+            # Generate noise
+            noise = tf.random.normal([1, self.config.Z_DIM])
+            
+            # Generate image from text embedding
+            generated_image, _ = self.generator([noise, embedding_batch], training=False)
+            generated_image = generated_image[0].numpy()  # Remove batch dimension
+            
+            # Display real and generated images side by side
+            plt.subplot(len(demo_samples), 2, i*2 + 1)
+            plt.imshow((real_image + 1) / 2.0)  # Convert from [-1,1] to [0,1]
+            plt.title(f"Real Image")
+            plt.axis('off')
+            
+            plt.subplot(len(demo_samples), 2, i*2 + 2)
+            plt.imshow((generated_image + 1) / 2.0)  # Convert from [-1,1] to [0,1]
+            plt.title(f"Generated from Text Embedding")
+            plt.axis('off')
+        
+        # Save the demonstration
+        demo_path = os.path.join(self.sample_dir, f'text_to_image_demo_epoch_{epoch}.png')
+        plt.tight_layout()
+        plt.savefig(demo_path)
+        plt.close()
+        
+        print(f"Text-to-image demonstration saved to {demo_path}")
+        
+        # Also generate a grid of images from fixed embeddings
+        self.save_samples(epoch, fixed_embeddings)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Stage-I GAN')
@@ -457,14 +778,23 @@ def main():
     
     # Create dataset
     dataset = Dataset(config)
-    train_dataset, dataset_size = dataset.get_data()
+    
+    # Visualize a few samples to verify text-image pairs are correctly processed
+    dataset.visualize_samples(num_samples=3)
+    
+    # Get training and validation datasets
+    train_dataset, train_size = dataset.get_data()
+    val_dataset, val_size = dataset.get_test_data()
+    
+    print(f"Training dataset size: {train_size}")
+    print(f"Validation dataset size: {val_size}")
     
     # Create trainer
     trainer = Stage1Trainer(config)
     
-    # Train Stage-I GAN
-    print("Training Stage-I GAN...")
-    trainer.train(train_dataset, dataset_size)
+    # Train Stage-I GAN with validation
+    print("Training Stage-I GAN with validation...")
+    trainer.train(train_dataset, val_dataset, train_size, val_size)
 
 if __name__ == '__main__':
     main()

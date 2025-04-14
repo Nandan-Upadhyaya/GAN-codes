@@ -4,4 +4,8 @@ train/
 bounding_boxes.txt
 images.txt
 char-CNN-RNN-embeddings.pickle
+logs/
+sample_pair_0.png
+sample_pair_1.png
+sample_pair_2.png
 
