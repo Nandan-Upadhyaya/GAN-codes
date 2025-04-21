@@ -8,4 +8,12 @@ logs/
 sample_pair_0.png
 sample_pair_1.png
 sample_pair_2.png
-
+checkpoints/
+metrics/
+samples/
+__pycache__/
+Data/
+generated_birds_1745216973.png
+generated_birds_1745217050.png
+generated_birds_1745217250.png
+generated_birds_1745217490.png

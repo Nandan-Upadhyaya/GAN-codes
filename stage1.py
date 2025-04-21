@@ -1,111 +1,322 @@
-import tensorflow as tf
-import numpy as np # Fixed typo from 'npp' to 'np'
+# Implementation of Stage-I GAN from StackGAN paper
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.models as models
+
+import numpy as np
+import scipy
+from scipy import linalg
 import os
 import time
 import pickle
-import argparse
+import random
+import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
-import requests
-import zipfile
-import tarfile
-import shutil
-import traceback  # Add traceback for better error reporting
-from model import StageIGenerator, StageIDiscriminator
-from scipy import linalg
-# Ensure compatibility with TensorFlow 2.10.1
-print(f"TensorFlow version: {tf.__version__}")
-# Ensure compatibility with TensorFlow 2.10.1
+
+# Only print version information in the main process
+if __name__ == "__main__":
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"Torchvision version: {torchvision.__version__}")
+    print(f"NumPy version: {np.__version__}")
+    print(f"SciPy version: {scipy.__version__}")
+    print(f"Matplotlib version: {matplotlib.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+
+# Set random seeds for reproducibility
+random.seed(123)
+np.random.seed(123)
+torch.manual_seed(123)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(123)
+
 class Config:
     # Data parameters
     DATASET_NAME = 'birds'  # 'birds' or 'flowers'
-    EMBEDDING_DIM = 1024  # dimension of the text embedding
-    Z_DIM = 100  # dimension of the noise vector
-    LOCAL_DATASET_PATH = None  # path to local dataset
-    # Stage I parameters
-    STAGE1_G_LR = 0.0002  # learning rate for stage 1 generator
-    STAGE1_D_LR = 0.0002  # learning rate for stage 1 discriminator
-    STAGE1_G_HDIM = 128  # hidden dimension for stage 1 generator
-    STAGE1_D_HDIM = 64   # hidden dimension for stage 1 discriminator
-    STAGE1_IMAGE_SIZE = 64  # size of image in stage 1
-    # Training parameters
-    BATCH_SIZE = 128  # Increased from 64 to better utilize GPU
-    EPOCHS = 600
+    EMBEDDING_DIM = 10240  # dimension of the text embedding for birds dataset
+    Z_DIM = 100  # dimension of the noise vector as in the paper
+    LOCAL_DATASET_PATH = None  # will be set later
+    
+    # Hyperparameters from StackGAN paper
+    STAGE1_G_LR = 0.0002  # learning rate for stage 1 generator (Adam) - paper value
+    STAGE1_D_LR = 0.0002  # learning rate for stage 1 discriminator (Adam) - paper value
+    STAGE1_G_HDIM = 64  # base filter size for generator as in paper
+    STAGE1_D_HDIM = 64  # base filter size for discriminator as in paper
+    STAGE1_IMAGE_SIZE = 64  # output size for Stage-I (64x64 as in paper)
+    
+    # Training parameters from paper
+    BATCH_SIZE = 128  # batch size from the StackGAN paper
+    EPOCHS = 600      # total epochs for training
     SNAPSHOT_INTERVAL = 50
-    NUM_EXAMPLES = 6  # number of examples to visualize during training
-    # Conditioning Augmentation
-    CA_DIM = 128  # dimension of the augmented conditioning vector
-    # Adam optimizer parameters
-    BETA1 = 0.5
-    BETA2 = 0.999
-    # KL divergence regularization weight
-    LAMBDA = 1.0
+    NUM_EXAMPLES = 6  # number of examples to visualize
+    
+    # Conditioning Augmentation parameters as in paper
+    CA_DIM = 128  # dimension of the CA output as in paper
+    
+    # Adam optimizer parameters from paper
+    BETA1 = 0.5    # paper value
+    BETA2 = 0.999  # paper value
+    
+    # KL divergence regularization weight from paper
+    LAMBDA = 2.0   # paper value
+    
     # Metrics parameters
-    FID_SAMPLE_SIZE = 1000  # number of samples for FID score calculation
-    IS_SPLITS = 10  # number of splits for Inception Score calculation
-    COMPUTE_FID = True  # whether to compute FID
-    COMPUTE_IS = True  # whether to compute Inception Score
-    COMPUTE_RPRECISION = True  # whether to compute R-precision
-    # Dataset URLs
-    BIRDS_DATASET_URL = "http://www.vision.caltech.edu/visipedia-data/CUB-200-2011/CUB_200_2011.tgz"
-    # Direct link to pre-processed embeddings for birds dataset
-    BIRDS_EMBEDDING_URL = r"C:\Users\nanda\OneDrive\Desktop\StackGAN\char-CNN-RNN-embeddings.pickle"
-    # Backup direct link for train/test splits
-    BIRDS_TRAIN_TEST_URL = "https://github.com/hanzhanggit/StackGAN/raw/master/Data/birds/train-test-split.pickle"
-    # Memory management
-    SHUFFLE_BUFFER_SIZE = 4000  # Keep at moderate size for good randomization
-    PREFETCH_BUFFER_SIZE = 100  # Increased from 12 to dramatically improve pipeline efficiency
+    EVAL_INTERVAL = 1
+    FID_SAMPLE_SIZE = 500
+    INCEPTION_SAMPLE_SIZE = 500
+    R_PRECISION_K = 5
+    
+    # Device configuration
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def __init__(self, images_path=None, train_path=None, test_path=None):
+        if images_path and train_path and test_path:
+            self.LOCAL_DATASET_PATH = {
+                'images': images_path,
+                'train': train_path,
+                'test': test_path
+            }
 
-
-def download_and_prepare_dataset(config):
-    """Use the local dataset without downloading anything"""
-    # Only use the provided local dataset path
-    if config.LOCAL_DATASET_PATH and os.path.exists(config.LOCAL_DATASET_PATH):
-        print(f"Using local dataset from: {config.LOCAL_DATASET_PATH}")
-        return config.LOCAL_DATASET_PATH
-    else:
-        raise ValueError("Please provide a valid local dataset path using --data_path argument. No downloads will be performed.")
-
-
-class Dataset:
-    def __init__(self, config):
+class GANMetrics:
+    """Class for computing standard GAN evaluation metrics"""
+    def __init__(self, config, lazy_load=True):
         self.config = config
-        self.image_size = config.STAGE1_IMAGE_SIZE
+        self.device = config.DEVICE
+        self.inception_model = None
+        self.inception_classifier = None
         
-        # Check if LOCAL_DATASET_PATH is a dictionary with required keys
-        if not isinstance(config.LOCAL_DATASET_PATH, dict) or not all(k in config.LOCAL_DATASET_PATH for k in ['images', 'train', 'test']):
-            raise ValueError("LOCAL_DATASET_PATH must be a dictionary with 'images', 'train', and 'test' keys")
-        # Set directories directly from the dictionary
-        self.image_dir = config.LOCAL_DATASET_PATH['images']
-        self.train_dir = config.LOCAL_DATASET_PATH['train']
-        self.test_dir = config.LOCAL_DATASET_PATH['test']
-        # Use the pickle files directly from train folder
-        self.embedding_path = os.path.join(self.train_dir, 'char-CNN-RNN-embeddings.pickle')
-        self.filenames_path = os.path.join(self.train_dir, 'filenames.pickle')
-        self.class_info_path = os.path.join(self.train_dir, 'class_info.pickle')
-        print(f"Using dataset structure:")
-        print(f"Images directory: {self.image_dir}")
-        print(f"Train directory: {self.train_dir}")
-        print(f"Test directory: {self.test_dir}")
-        print(f"Embeddings file: {self.embedding_path}")
-        print(f"Filenames file: {self.filenames_path}")
-        # Verify files exist
-        if not os.path.exists(self.embedding_path):
-            raise FileNotFoundError(f"Embeddings file not found: {self.embedding_path}")
-        if not os.path.exists(self.filenames_path):
-            raise FileNotFoundError(f"Filenames file not found: {self.filenames_path}")
-        if not os.path.exists(self.image_dir):
-            raise FileNotFoundError(f"Images directory not found: {self.image_dir}")
-        # Load text embeddings
-        with open(self.embedding_path, 'rb') as f:
-            self.embeddings = pickle.load(f, encoding='latin1')
-        # Load filenames
-        with open(self.filenames_path, 'rb') as f:
-            self.filenames = pickle.load(f, encoding='latin1')
-        self.dataset_size = len(self.filenames)
-        print(f"Dataset size: {self.dataset_size}")
-        print(f"Sample filename: {self.filenames[0] if self.dataset_size > 0 else 'No files found'}")
-
+        if not lazy_load:
+            self._load_inception_models()
+    
+    def _load_inception_models(self):
+        if self.inception_model is not None and self.inception_classifier is not None:
+            return  # Already loaded
+            
+        print("Loading Inception v3 model for metrics calculation...")
+        start_time = time.time()
+        
+        # Model for feature extraction (FID) - with progress indication
+        print("  - Loading feature extraction model...")
+        self.inception_model = models.inception_v3(weights=torchvision.models.Inception_V3_Weights.DEFAULT)
+        self.inception_model.fc = nn.Identity()  # Remove classification layer
+        self.inception_model.eval()
+        self.inception_model = self.inception_model.to(self.device)
+        print(f"  - Feature extraction model loaded in {time.time() - start_time:.1f}s")
+        
+        # Model for classification scores (Inception Score) - with progress indication
+        class_time = time.time()
+        print("  - Loading classification model...")
+        self.inception_classifier = models.inception_v3(pretrained=True, progress=True)
+        self.inception_classifier.eval()
+        self.inception_classifier = self.inception_classifier.to(self.device)
+        print(f"  - Classification model loaded in {time.time() - class_time:.1f}s")
+        
+        print(f"Inception models loaded successfully in {time.time() - start_time:.1f}s total")
+    
+    def _get_activations(self, images, model, batch_size=50):
+        """Get Inception activations for a batch of images"""
+        # Make sure models are loaded before calculation
+        if self.inception_model is None or self.inception_classifier is None:
+            self._load_inception_models()
+            
+        n_batches = len(images) // batch_size + (1 if len(images) % batch_size != 0 else 0)
+        activations = []
+        
+        for i in range(n_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(images))
+            batch = images[start_idx:end_idx].to(self.device)
+            
+            # Resize for Inception v3 (299x299)
+            batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=True)
+            
+            # Get activations
+            with torch.no_grad():
+                batch_activations = model(batch)
+                activations.append(batch_activations.cpu().detach())
+                
+        return torch.cat(activations, dim=0)
+    
+    def calculate_fid(self, real_images, fake_images):
+        """Calculate FID score between real and fake images"""
+        print("Calculating FID score...")
+        # Make sure models are loaded before calculation
+        if self.inception_model is None:
+            self._load_inception_models()
+            
+        # Get activations
+        real_activations = self._get_activations(real_images, self.inception_model)
+        fake_activations = self._get_activations(fake_images, self.inception_model)
+        
+        # Convert to NumPy arrays
+        real_activations = real_activations.numpy()
+        fake_activations = fake_activations.numpy()
+        
+        # Calculate mean and covariance statistics
+        real_mu = np.mean(real_activations, axis=0)
+        fake_mu = np.mean(fake_activations, axis=0)
+        real_sigma = np.cov(real_activations, rowvar=False)
+        fake_sigma = np.cov(fake_activations, rowvar=False)
+        
+        # Calculate FID
+        mu_diff = real_mu - fake_mu
+        mu_diff_sq = np.dot(mu_diff, mu_diff)
+        covmean = linalg.sqrtm(np.dot(real_sigma, fake_sigma))
+        
+        # Check for numerical issues
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+            
+        trace_term = np.trace(real_sigma + fake_sigma - 2.0 * covmean)
+        fid = mu_diff_sq + trace_term
+        
+        return fid
+    
+    def calculate_inception_score(self, fake_images, splits=10):
+        """Calculate Inception Score for fake images"""
+        print("Calculating Inception Score...")
+        # Make sure models are loaded before calculation
+        if self.inception_classifier is None:
+            self._load_inception_models()
+            
+        # Get predictions
+        preds = []
+        n_batches = len(fake_images) // 50 + (1 if len(fake_images) % 50 != 0 else 0)
+        
+        for i in range(n_batches):
+            start_idx = i * 50
+            end_idx = min((i + 1) * 50, len(fake_images))
+            batch = fake_images[start_idx:end_idx].to(self.device)
+            
+            # Resize for Inception v3 (299x299)
+            batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=True)
+            
+            # Get predictions
+            with torch.no_grad():
+                pred = F.softmax(self.inception_classifier(batch), dim=1)
+                preds.append(pred.cpu().numpy())
+                
+        preds = np.concatenate(preds, axis=0)
+        
+        # Calculate mean kl-divergence
+        split_scores = []
+        n_images = len(preds)
+        split_size = n_images // splits
+        
+        for i in range(splits):
+            part = preds[i * split_size:(i + 1) * split_size]
+            kl = part * (np.log(part) - np.log(np.mean(part, axis=0, keepdims=True) + 1e-10) + 1e-10)
+            kl = np.mean(np.sum(kl, axis=1))
+            split_scores.append(np.exp(kl))
+            
+        # Return mean and std of IS
+        is_mean = np.mean(split_scores)
+        is_std = np.std(split_scores)
+        
+        return is_mean, is_std
+    
+    def calculate_r_precision(self, image_data, text_embeddings, k=5):
+        """Calculate R-precision for text-image matching"""
+        print("Calculating R-precision...")
+        
+        # First extract image features using the inception model
+        if self.inception_model is None:
+            self._load_inception_models()
+        
+        # Convert data to appropriate format
+        if isinstance(image_data, torch.Tensor):
+            image_data = image_data.to(self.device)
+        else:
+            image_data = torch.tensor(image_data).to(self.device)
+            
+        if isinstance(text_embeddings, torch.Tensor):
+            text_embeddings = text_embeddings.cpu().numpy()
+        
+        # Extract features from images using inception model
+        image_features = self._get_activations(image_data, self.inception_model).cpu().numpy()
+        
+        # Project text embeddings to match inception feature dimensions (10240 → 2048)
+        from sklearn.decomposition import PCA
+        
+        # Get dimensions
+        n_samples = len(text_embeddings)
+        feature_dim = image_features.shape[1]  # This should be 2048 for InceptionV3
+        
+        # Use a simple linear projection with matrix multiplication instead of PCA
+        # First create a random but consistent projection matrix
+        np.random.seed(42)  # For consistency between runs
+        projection_matrix = np.random.randn(text_embeddings.shape[1], feature_dim) / np.sqrt(feature_dim)
+        
+        # Project the text embeddings to match image feature dimensions
+        text_embeddings_reduced = np.matmul(text_embeddings, projection_matrix)
+        
+        # Normalize embeddings for cosine similarity
+        image_norm = np.linalg.norm(image_features, axis=1, keepdims=True)
+        text_norm = np.linalg.norm(text_embeddings_reduced, axis=1, keepdims=True) 
+        image_features = image_features / (image_norm + 1e-8)
+        text_embeddings_reduced = text_embeddings_reduced / (text_norm + 1e-8)
+        
+        # Calculate similarity matrix
+        similarity = np.matmul(image_features, text_embeddings_reduced.T)
+        
+        # Calculate R-precision
+        r_precision = 0.0
+        for i in range(len(similarity)):
+            # Get top-k indices
+            top_k_indices = np.argsort(similarity[i])[-k:]
+            # Check if true match (index i) is in top k
+            if i in top_k_indices:
+                r_precision += 1.0
+                
+        # Normalize by number of samples
+        r_precision /= len(similarity)
+        
+        return r_precision
+    
+class BirdsDataset(Dataset):
+    def __init__(self, config, image_dir, embeddings, filenames, transform=None):
+        self.config = config
+        self.image_dir = image_dir
+        self.embeddings = embeddings
+        self.filenames = filenames
+        self.image_size = config.STAGE1_IMAGE_SIZE
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((config.STAGE1_IMAGE_SIZE, config.STAGE1_IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-1, 1]
+        ])
+        
+    def __len__(self):
+        return len(self.filenames)
+        
+    def __getitem__(self, idx):
+        try:
+            # Get embedding
+            embedding = self.embeddings[idx]
+            # Load image
+            filename = self.filenames[idx]
+            image = self.load_image(filename)
+            
+            # Convert embedding to tensor
+            if isinstance(embedding, list) or (isinstance(embedding, np.ndarray) and len(embedding.shape) > 1):
+                embedding = np.array(embedding).flatten()
+            embedding = torch.tensor(embedding, dtype=torch.float32)
+            
+            return image, embedding
+        except Exception as e:
+            print(f"Error loading item {idx}: {e}")
+            # Return a placeholder in case of error
+            dummy_img = torch.zeros(3, self.image_size, self.image_size)
+            dummy_emb = torch.zeros(self.config.EMBEDDING_DIM)
+            return dummy_img, dummy_emb
+    
     def load_image(self, filename):
         """Load and preprocess image"""
         # Normalize path separators for Windows
@@ -127,7 +338,7 @@ class Dataset:
                 if os.path.exists(img_path):
                     return self._process_image(img_path)
             bird_class = None
-        # If not found, or no class in filename, search all class directories
+        # If not found, search all class directories
         for dir_name in os.listdir(self.image_dir):
             class_path = os.path.join(self.image_dir, dir_name)
             if not os.path.isdir(class_path):
@@ -145,1124 +356,846 @@ class Dataset:
                 if base_img_name == base_file:
                     img_path = os.path.join(class_path, img_file)
                     return self._process_image(img_path)
-                # If still not found, try more relaxed matching
-                # This might catch cases where naming conventions differ slightly
-                if base_img_name.replace('_', '') == base_file.replace('_', ''):
-                    img_path = os.path.join(class_path, img_file)
-                    return self._process_image(img_path)
         # If we reach here, image was not found
         print(f"Warning: Image not found: {filename}")
         # Return a black image as placeholder
-        return np.zeros((self.image_size, self.image_size, 3))
+        black_img = Image.new('RGB', (self.image_size, self.image_size), 'black')
+        return self.transform(black_img)
 
     def _process_image(self, img_path):
         """Process an image given its path"""
         img = Image.open(img_path).convert('RGB')
-        img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        img = np.array(img) / 127.5 - 1.0  # Normalize to [-1, 1]
+        if self.transform:
+            return self.transform(img)
         return img
+    
+
+
+class DataManager:
+    def __init__(self, config):
+        self.config = config
+        self.image_size = config.STAGE1_IMAGE_SIZE
+        
+        # Check if LOCAL_DATASET_PATH is a dictionary with required keys
+        if not isinstance(config.LOCAL_DATASET_PATH, dict) or not all(k in config.LOCAL_DATASET_PATH for k in ['images', 'train', 'test']):
+            raise ValueError("LOCAL_DATASET_PATH must be a dictionary with 'images', 'train', and 'test' keys")
+        
+        # Set directories directly from the dictionary
+        self.image_dir = config.LOCAL_DATASET_PATH['images']
+        self.train_dir = config.LOCAL_DATASET_PATH['train']
+        self.test_dir = config.LOCAL_DATASET_PATH['test']
+        
+        # Use the pickle files directly from train folder
+        self.embedding_path = os.path.join(self.train_dir, 'char-CNN-RNN-embeddings.pickle')
+        self.filenames_path = os.path.join(self.train_dir, 'filenames.pickle')
+        
+        print(f"Using dataset structure:")
+        print(f"Images directory: {self.image_dir}")
+        print(f"Train directory: {self.train_dir}")
+        print(f"Test directory: {self.test_dir}")
+        
+        # Verify files exist
+        if not os.path.exists(self.embedding_path):
+            raise FileNotFoundError(f"Embeddings file not found: {self.embedding_path}")
+        if not os.path.exists(self.filenames_path):
+            raise FileNotFoundError(f"Filenames file not found: {self.filenames_path}")
+        if not os.path.exists(self.image_dir):
+            raise FileNotFoundError(f"Images directory not found: {self.image_dir}")
+            
+        # Load text embeddings
+        with open(self.embedding_path, 'rb') as f:
+            self.embeddings = pickle.load(f, encoding='latin1')
+            
+        # Load filenames
+        with open(self.filenames_path, 'rb') as f:
+            self.filenames = pickle.load(f, encoding='latin1')
+            
+        self.dataset_size = len(self.filenames)
+        print(f"Dataset size: {self.dataset_size}")
+        print(f"Sample filename: {self.filenames[0] if self.dataset_size > 0 else 'No files found'}")
+        
+        # Create transform for image processing
+        self.transform = transforms.Compose([
+            transforms.Resize((config.STAGE1_IMAGE_SIZE, config.STAGE1_IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-1, 1]
+        ])
 
     def get_data(self):
-        """Return a TensorFlow dataset that streams data efficiently"""
-        print("Setting up data streaming pipeline for memory efficiency...")
+        """Return a PyTorch DataLoader for training"""
+        print("Setting up data streaming pipeline...")
         # Check embeddings format
         is_embeddings_list = isinstance(self.embeddings, list)
         if is_embeddings_list:
-            print("Detected embeddings as a list structure. Using index-based matching.")
             print(f"Embeddings length: {len(self.embeddings)}")
             print(f"Filenames length: {len(self.filenames)}")
-            # Check embedding shape
-            sample_embedding = self.embeddings[0]
-            print(f"Sample embedding shape: {np.array(sample_embedding).shape}")
-            # Create a generator function that yields one sample at a time
-            def data_generator():
-                for i, filename in enumerate(self.filenames):
-                    if i >= len(self.embeddings):
-                        continue
-                    try:
-                        image = self.load_image(filename)
-                        embedding = self.embeddings[i]
-                        # Handle 3D embeddings - flatten to 2D
-                        embedding_arr = np.array(embedding)
-                        if len(embedding_arr.shape) > 2:
-                            print(f"Reshaping embeddings from {embedding_arr.shape} to 2D") if i == 0 else None
-                            # If shape is [seq_len, emb_dim], flatten it
-                            embedding_arr = embedding_arr.flatten()
-                        yield image, embedding_arr
-                        # Print progress occasionally
-                        if (i+1) % 1000 == 0:
-                            print(f"Streamed {i+1}/{self.dataset_size} images")
-                    except Exception as e:
-                        print(f"Error loading {filename}: {e}")
-            # Create output signature for the dataset
-            sample_embedding_arr = np.array(self.embeddings[0])
-            if len(sample_embedding_arr.shape) > 2:
-                # If 3D, convert to flattened 1D
-                emb_shape = sample_embedding_arr.shape[0] * sample_embedding_arr.shape[1]
-                embedding_shape = tf.TensorShape([emb_shape])
-            else:
-                embedding_shape = tf.TensorShape(sample_embedding_arr.shape)
-            # Create TensorFlow dataset from generator
-            dataset = tf.data.Dataset.from_generator(
-                data_generator,
-                output_signature=(
-                    tf.TensorSpec(shape=(self.image_size, self.image_size, 3), dtype=tf.float32),
-                    tf.TensorSpec(shape=embedding_shape, dtype=tf.float32)
-                )
+            
+            # Create PyTorch Dataset
+            train_dataset = BirdsDataset(
+                self.config,
+                self.image_dir,
+                self.embeddings,
+                self.filenames,
+                self.transform
             )
-            # Estimate dataset size (may be slightly smaller due to skipped errors)
+            
+            # Create DataLoader
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.config.BATCH_SIZE,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True if self.config.DEVICE.type == 'cuda' else False,
+                drop_last=True
+            )
+            
+            # Estimate dataset size
             estimated_size = min(len(self.filenames), len(self.embeddings))
+            
         else:
             # Dictionary-based embeddings not implemented yet
             raise ValueError("Dictionary-based embeddings not implemented yet")
-        # Apply dataset transformations
-        dataset = dataset.shuffle(buffer_size=4000)  # Smaller buffer to save memory
-        dataset = dataset.batch(self.config.BATCH_SIZE, drop_remainder=True)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-        return dataset, estimated_size
+            
+        return train_loader, estimated_size
 
     def get_test_data(self):
-        """Return a TensorFlow dataset for testing/validation"""
+        """Return a PyTorch DataLoader for testing/validation"""
         print("Setting up test data streaming pipeline...")
         # Load test embeddings and filenames
         test_embedding_path = os.path.join(self.test_dir, 'char-CNN-RNN-embeddings.pickle')
         test_filenames_path = os.path.join(self.test_dir, 'filenames.pickle')
+        
         # Verify files exist
         if not os.path.exists(test_embedding_path):
             raise FileNotFoundError(f"Test embeddings file not found: {test_embedding_path}")
         if not os.path.exists(test_filenames_path):
             raise FileNotFoundError(f"Test filenames file not found: {test_filenames_path}")
+            
         # Load test text embeddings
         with open(test_embedding_path, 'rb') as f:
             test_embeddings = pickle.load(f, encoding='latin1')
+            
         # Load test filenames
         with open(test_filenames_path, 'rb') as f:
             test_filenames = pickle.load(f, encoding='latin1')
+            
         test_dataset_size = len(test_filenames)
         print(f"Test dataset size: {test_dataset_size}")
-        # Check embeddings format
-        is_embeddings_list = isinstance(test_embeddings, list)
-        if is_embeddings_list:
-            print("Detected test embeddings as a list structure.")
-            # Create a generator function for test data
-            def test_data_generator():
-                for i, filename in enumerate(test_filenames):
-                    if i >= len(test_embeddings):
-                        continue
-                    try:
-                        image = self.load_image(filename)
-                        embedding = test_embeddings[i]
-                        # Handle 3D embeddings - flatten to 2D
-                        embedding_arr = np.array(embedding)
-                        if len(embedding_arr.shape) > 2:
-                            embedding_arr = embedding_arr.flatten()
-                        yield image, embedding_arr
-                    except Exception as e:
-                        print(f"Error loading test image {filename}: {e}")
-            # Create output signature for the dataset
-            sample_embedding_arr = np.array(test_embeddings[0])
-            if len(sample_embedding_arr.shape) > 2:
-                emb_shape = sample_embedding_arr.shape[0] * sample_embedding_arr.shape[1]
-            else:
-                emb_shape = sample_embedding_arr.shape
-            embedding_shape = tf.TensorShape(emb_shape)
-            # Create TensorFlow dataset from generator
-            test_dataset = tf.data.Dataset.from_generator(
-                test_data_generator,
-                output_signature=(
-                    tf.TensorSpec(shape=(self.image_size, self.image_size, 3), dtype=tf.float32),
-                    tf.TensorSpec(shape=embedding_shape, dtype=tf.float32)
-                )
-            )
-            # Estimate dataset size
-            estimated_size = min(len(test_filenames), len(test_embeddings))
-        else:
-            # Dictionary-based embeddings not implemented yet
-            raise ValueError("Dictionary-based embeddings not implemented yet")
-        # Apply dataset transformations - no shuffling for validation
-        test_dataset = test_dataset.batch(self.config.BATCH_SIZE, drop_remainder=True)
-        test_dataset = test_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-        return test_dataset, estimated_size
+        
+        # Create PyTorch Dataset
+        test_dataset = BirdsDataset(
+            self.config,
+            self.image_dir,
+            test_embeddings,
+            test_filenames,
+            self.transform
+        )
+        
+        # Create DataLoader (no shuffling for validation)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True if self.config.DEVICE.type == 'cuda' else False,
+            drop_last=True
+        )
+        
+        # Estimate dataset size
+        estimated_size = min(len(test_filenames), len(test_embeddings))
+        
+        return test_loader, estimated_size
 
     def visualize_samples(self, num_samples=3):
         """Visualize a few samples to verify text-image pairs"""
         print("Visualizing sample text-image pairs for verification...")
-        for i, (filename, embedding) in enumerate(zip(self.filenames[:num_samples], self.embeddings[:num_samples])):
+        # Create a dataset for visualization
+        viz_dataset = BirdsDataset(
+            self.config,
+            self.image_dir,
+            self.embeddings[:num_samples],
+            self.filenames[:num_samples],
+            self.transform
+        )
+        
+        for i in range(num_samples):
             try:
-                # Load and display image
-                img = self.load_image(filename)
+                # Get image and embedding
+                image, embedding = viz_dataset[i]
+                
+                # Convert tensor to numpy for plotting
+                image_np = image.numpy().transpose(1, 2, 0)
+                image_np = (image_np + 1) / 2.0  # Convert from [-1,1] to [0,1]
+                
                 plt.figure(figsize=(8, 4))
                 # Image display
                 plt.subplot(1, 2, 1)
-                plt.imshow((img + 1) / 2.0)  # Convert from [-1,1] to [0,1]
-                plt.title(f"Image: {filename}")
+                plt.imshow(image_np)
+                plt.title(f"Image: {self.filenames[i]}")
                 plt.axis('off')
-                # Embedding visualization (show first 20 values of flattened array)
-                embedding_arr = np.array(embedding)
-                # Reshape embedding - this is the key fix
-                if len(embedding_arr.shape) > 1:
-                    # For 2D embeddings (sequence, features), take mean across sequence
-                    flat_embedding = embedding_arr.flatten()
-                    # Use the first 20 elements
-                    embedding_values = flat_embedding[:20]
-                else:
-                    embedding_values = embedding_arr[:20]
+                
+                # Embedding visualization (show first 20 values)
+                embedding_np = embedding.numpy()
+                embedding_values = embedding_np[:20]
+                
                 plt.subplot(1, 2, 2)
                 plt.bar(range(len(embedding_values)), embedding_values)
-                plt.title(f"First 20 embedding values\nShape: {embedding_arr.shape}")
+                plt.title(f"First 20 embedding values\nShape: {embedding_np.shape}")
                 plt.tight_layout()
                 plt.savefig(f"sample_pair_{i}.png")
                 plt.close()
-                print(f"Sample {i+1}: Image shape {img.shape}, Embedding shape {embedding_arr.shape}")
+                print(f"Sample {i+1}: Image shape {image_np.shape}, Embedding shape {embedding_np.shape}")
             except Exception as e:
                 print(f"Error visualizing sample {i}: {e}")
-        print("Sample visualizations saved as sample_pair_X.png files")
 
+class ConditioningAugmentation(nn.Module):
+    """
+    Conditioning Augmentation module as described in StackGAN paper.
+    Transforms text embeddings into conditioning variables following a Gaussian distribution.
+    """
+    def __init__(self, input_dim, output_dim):
+        super(ConditioningAugmentation, self).__init__()
+        # First reduce input dimension to make it tractable
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, output_dim * 2),  # *2 for mean and log variance
+        )
+        self.output_dim = output_dim
+        
+    def forward(self, x):
+        # Get mean and log variance
+        x = self.fc(x)
+        mu = x[:, :self.output_dim]
+        logvar = x[:, self.output_dim:]
+        
+        # Calculate KL divergence loss as in paper: -1/2 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        kl_loss = kl_loss / mu.size(0)  # normalize by batch size
+        
+        # Reparameterization trick: sample from N(mu, sigma^2)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        c_hat = mu + eps * std
+        
+        return c_hat, kl_loss
 
-def save_images(images, path):
-    """Save images to a single figure"""
-    images = (images + 1) / 2.0  # Rescale to [0, 1]
-    n_images = images.shape[0]
-    rows = int(np.sqrt(n_images))
-    cols = int(np.ceil(n_images / rows))
-    plt.figure(figsize=(cols * 2, rows * 2))
-    for i, image in enumerate(images):
-        plt.subplot(rows, cols, i + 1)
-        plt.imshow(image)
-        plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
+class StageIGenerator(nn.Module):
+    """
+    Generator for Stage-I GAN as described in StackGAN paper.
+    Generates 64x64 images based on text embeddings and random noise.
+    """
+    def __init__(self, config):
+        super(StageIGenerator, self).__init__()
+        self.config = config
+        ngf = config.STAGE1_G_HDIM
+        
+        # Conditioning Augmentation as in paper
+        self.ca = ConditioningAugmentation(config.EMBEDDING_DIM, config.CA_DIM)
+        
+        # Initial dense layer to project and reshape
+        self.fc = nn.Linear(config.Z_DIM + config.CA_DIM, ngf * 8 * 4 * 4)
+        
+        # Upsampling layers exactly as in paper: 4x4 -> 64x64
+        self.upsample1 = nn.Sequential(
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),  # 4x4 -> 8x8
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upsample2 = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),  # 8x8 -> 16x16
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upsample3 = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),  # 16x16 -> 32x32
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upsample4 = nn.Sequential(
+            nn.ConvTranspose2d(ngf, 3, 4, 2, 1, bias=False),  # 32x32 -> 64x64
+            nn.Tanh()  # Output in range [-1, 1] as in paper
+        )
+        
+    def forward(self, noise, text_embedding):
+        # Process through conditioning augmentation
+        c_hat, kl_loss = self.ca(text_embedding)
+        
+        # Concatenate noise and conditioning variable
+        z_c = torch.cat([noise, c_hat], dim=1)
+        
+        # Project and reshape
+        out = self.fc(z_c)
+        out = out.view(-1, self.config.STAGE1_G_HDIM * 8, 4, 4)
+        
+        # Upsampling to 64x64 as in paper
+        out = self.upsample1(out)
+        out = self.upsample2(out)
+        out = self.upsample3(out)
+        out = self.upsample4(out)
+        
+        return out, kl_loss
 
+class StageIDiscriminator(nn.Module):
+    """
+    Discriminator for Stage-I GAN as described in StackGAN paper.
+    Classifies 64x64 images as real or fake based on the image and text embedding.
+    """
+    def __init__(self, config):
+        super(StageIDiscriminator, self).__init__()
+        self.config = config
+        ndf = config.STAGE1_D_HDIM
+        
+        # Image encoder: extract image features (64x64 -> 4x4)
+        self.img_encoder = nn.Sequential(
+            # 64x64 -> 32x32
+            nn.Conv2d(3, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # 32x32 -> 16x16
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # 16x16 -> 8x8
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # 8x8 -> 4x4
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Text embedding compression as in paper
+        self.text_encoder = nn.Sequential(
+            nn.Linear(config.EMBEDDING_DIM, ndf * 8),
+            nn.BatchNorm1d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Final classification layer
+        self.joint_encoder = nn.Sequential(
+            nn.Conv2d(ndf * 16, ndf * 8, 1, 1, 0, bias=False),  # Compress channels
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),  # 4x4 -> 1x1
+            nn.Sigmoid()  # Output probability as in original GAN
+        )
+        
+    def forward(self, img, text_embedding):
+        # Extract image features
+        img_features = self.img_encoder(img)  # [batch, ndf*8, 4, 4]
+        
+        # Process text embedding
+        text_features = self.text_encoder(text_embedding)  # [batch, ndf*8]
+        
+        # Spatially replicate text features to match image feature dimensions
+        text_features = text_features.view(-1, self.config.STAGE1_D_HDIM * 8, 1, 1)
+        text_features = text_features.repeat(1, 1, 4, 4)  # [batch, ndf*8, 4, 4]
+        
+        # Concatenate along channel dimension
+        combined_features = torch.cat([img_features, text_features], dim=1)  # [batch, ndf*16, 4, 4]
+        
+        # Process through joint encoder
+        output = self.joint_encoder(combined_features)
+        
+        return output.view(-1)
 
-def save_model(model, path):
-    """Save model weights"""
-    model.save_weights(path)
-
-
-def load_model(model, path):
-    """Load model weights"""
-    model.load_weights(path)
-
-
-# Add TensorFlow Probability for FID calculation
-try:
-    import tensorflow_probability as tfp
-except ImportError:
-    print("TensorFlow Probability not installed. Some metrics may not work correctly.")
-    # Create a simple mock for tfp.stats.covariance
-    class MockTFP:
-        class stats:
-            @staticmethod
-            def covariance(x):
-                # Simple covariance implementation
-                x_centered = x - tf.reduce_mean(x, axis=0, keepdims=True)
-                return tf.matmul(x_centered, x_centered, transpose_a=True) / tf.cast(tf.shape(x)[0], tf.float32)
-    tfp = MockTFP()
-
-
-class GANMetrics:
-    """Class for computing GAN evaluation metrics as described in the StackGAN paper"""
-
+class GANTrainer:
     def __init__(self, config):
         self.config = config
-        # Create directories for metrics logs
-        self.metrics_dir = os.path.join('metrics', config.DATASET_NAME)
-        os.makedirs(self.metrics_dir, exist_ok=True)
-        # Load inception model for FID and IS
-        if config.COMPUTE_FID or config.COMPUTE_IS:
-            print("Loading Inception model for metrics...")
-            self.inception_model = tf.keras.applications.InceptionV3(
-                include_top=False,
-                weights='imagenet',
-                pooling='avg'
-            )
-            print("Inception model loaded.")
-            # For inception score we need the logits
-            self.inception_model_with_top = tf.keras.applications.InceptionV3(
-                weights='imagenet',
-                include_top=True
-            )
-
-    def _preprocess_for_inception(self, images):
-        """Preprocess images for Inception model"""
-        # Convert from [-1, 1] to [0, 1]
-        images = (images + 1) / 2.0
-        # Resize to 299x299 and preprocess for Inception
-        images = tf.image.resize(images, (299, 299))
-        images = tf.keras.applications.inception_v3.preprocess_input(images * 255.0)
-        return images
-
-    def compute_inception_features_in_batches(self, images, batch_size=16):
-        """Compute Inception features in small batches to avoid OOM"""
-        # Process in smaller batches to avoid memory issues
-        num_images = images.shape[0]
-        num_batches = int(np.ceil(num_images / batch_size))
-        all_features = []
-        
-        print(f"Computing inception features in {num_batches} batches of size {batch_size}")
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_images)
-            batch = images[start_idx:end_idx]
-            
-            # Clear previous tensors to free memory
-            tf.keras.backend.clear_session()
-            # Ensure we're not keeping unnecessary tensors
-            tf.compat.v1.reset_default_graph()
-            
-            # Process batch
-            preprocessed_batch = self._preprocess_for_inception(batch)
-            batch_features = self.inception_model(preprocessed_batch)
-            all_features.append(batch_features)
-            
-            # Print progress
-            if (i + 1) % 5 == 0 or i == num_batches - 1:
-                print(f"  Processed batch {i+1}/{num_batches}")
-                
-            # Release memory
-            del preprocessed_batch
-            del batch_features
-            
-        # Concatenate all features
-        return tf.concat(all_features, axis=0)
-
-    def compute_fid(self, real_images, fake_images):
-        """Compute Fréchet Inception Distance between real and fake images
-        
-        This is a key metric from the StackGAN paper for evaluating
-        the quality and diversity of generated images.
-        """
-        if not self.config.COMPUTE_FID:
-            return float('nan')
-        
-        try:
-            print("Computing FID score...")
-            # Use a smaller batch size for feature extraction
-            batch_size = 8  # Reduce from default to use less memory
-            
-            # Get Inception features batch by batch
-            real_features = self.compute_inception_features_in_batches(real_images, batch_size)
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            fake_features = self.compute_inception_features_in_batches(fake_images, batch_size)
-            gc.collect()
-            
-            # Use NumPy for calculations to avoid TF memory issues
-            real_features_np = real_features.numpy()
-            fake_features_np = fake_features.numpy()
-            
-            # Calculate mean and covariance
-            real_mean = np.mean(real_features_np, axis=0)
-            fake_mean = np.mean(fake_features_np, axis=0)
-            real_cov = np.cov(real_features_np, rowvar=False)
-            fake_cov = np.cov(fake_features_np, rowvar=False)
-            
-            # Calculate squared difference between means
-            mean_diff_squared = np.sum((real_mean - fake_mean) ** 2)
-            
-            # Calculate matrix sqrt of product of covariances
-            covmean = linalg.sqrtm(real_cov.dot(fake_cov))
-            
-            # Check for complex numbers and take real part
-            if np.iscomplexobj(covmean):
-                covmean = covmean.real
-                
-            # Calculate trace term
-            trace_term = np.trace(real_cov + fake_cov - 2.0 * covmean)
-            
-            # FID formula
-            fid = float(mean_diff_squared + trace_term)
-            
-            # Clean up to free memory
-            del real_features, fake_features, real_features_np, fake_features_np
-            del real_mean, fake_mean, real_cov, fake_cov, covmean
-            gc.collect()
-            
-            return fid
-        except Exception as e:
-            print(f"Error computing FID: {e}")
-            # Print stack trace for debugging
-            import traceback
-            traceback.print_exc()
-            return float('nan')
-
-    def compute_inception_score(self, fake_images, splits=10):
-        """Compute Inception Score for fake images
-        
-        This metric (mentioned in the StackGAN paper) measures both
-        the quality and diversity of generated images.
-        """
-        if not self.config.COMPUTE_IS:
-            return float('nan'), float('nan')
-        
-        try:
-            print("Computing Inception Score...")
-            
-            # Process in smaller batches to avoid memory issues
-            batch_size = 8
-            n_samples = fake_images.shape[0]
-            n_batches = int(np.ceil(n_samples / batch_size))
-            
-            # Collect all softmax predictions
-            all_preds = []
-            
-            print(f"Computing IS on {n_batches} batches of size {batch_size}")
-            for i in range(n_batches):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, n_samples)
-                batch = fake_images[start_idx:end_idx]
-                
-                # Clear memory
-                tf.keras.backend.clear_session()
-                
-                # Process batch
-                preprocessed_batch = self._preprocess_for_inception(batch)
-                batch_preds = self.inception_model_with_top(preprocessed_batch)
-                all_preds.append(batch_preds.numpy())
-                
-                # Print progress
-                if (i + 1) % 5 == 0 or i == n_batches - 1:
-                    print(f"  Processed batch {i+1}/{n_batches}")
-                
-                # Clear memory
-                del preprocessed_batch
-                del batch_preds
-                import gc
-                gc.collect()
-            
-            # Concatenate all predictions
-            preds = np.concatenate(all_preds, axis=0)
-            
-            # Split predictions
-            split_scores = []
-            chunk_size = n_samples // splits
-            
-            for i in range(splits):
-                start = i * chunk_size
-                end = start + chunk_size
-                if i == splits - 1:
-                    end = n_samples
-                    
-                # Get split predictions
-                split_preds = preds[start:end]
-                
-                # Calculate KL divergence (use numpy for stability)
-                kl = split_preds * (np.log(split_preds + 1e-10) - 
-                                np.log(np.mean(split_preds, axis=0, keepdims=True) + 1e-10))
-                kl = np.mean(np.sum(kl, axis=1))
-                
-                # Calculate split score
-                split_scores.append(np.exp(kl))
-            
-            # Clean up to free memory
-            del preds, all_preds
-            gc.collect()
-            
-            # Return mean and std of split scores
-            return float(np.mean(split_scores)), float(np.std(split_scores))
-        
-        except Exception as e:
-            print(f"Error computing Inception Score: {e}")
-            import traceback
-            traceback.print_exc()
-            return float('nan'), float('nan')
-
-    def compute_r_precision(self, real_images, fake_images, text_embeddings, k=1):
-        """Compute R-precision for text-image matching
-        
-        This metric evaluates whether the model generates images that
-        match their conditioning text embeddings.
-        """
-        if not self.config.COMPUTE_RPRECISION:
-            return float('nan')
-        
-        try:
-            print("Computing R-precision...")
-            
-            # Process in smaller batches to avoid memory issues
-            batch_size = 8
-            sample_size = min(100, fake_images.shape[0])  # Use a smaller subset
-            
-            # Take a subset to reduce memory usage
-            indices = np.random.choice(fake_images.shape[0], sample_size, replace=False)
-            fake_images_subset = tf.gather(fake_images, indices)
-            text_embeddings_subset = tf.gather(text_embeddings, indices)
-            
-            # Compute features in batches
-            fake_img_features = self.compute_inception_features_in_batches(fake_images_subset, batch_size)
-            
-            # Normalize both text embeddings and image features for cosine similarity
-            if len(text_embeddings_subset.shape) > 2:
-                # Flatten text embeddings if they're 3D (sequence of embeddings)
-                text_embeddings_subset = tf.reshape(text_embeddings_subset, [text_embeddings_subset.shape[0], -1])
-            
-            # Converting to numpy for memory efficiency
-            text_emb_np = text_embeddings_subset.numpy()
-            fake_img_features_np = fake_img_features.numpy()
-            
-            print(f"Text embeddings shape: {text_emb_np.shape}, Image features shape: {fake_img_features_np.shape}")
-            
-            # Fix dimension mismatch issue with a more robust approach
-            try:
-                # Ensure we're using the right dimensionality
-                feature_dim = fake_img_features_np.shape[1]
-                
-                print(f"Using SVD to reduce text embeddings from {text_emb_np.shape[1]} to {feature_dim}")
-                from sklearn.decomposition import TruncatedSVD
-                
-                # Create SVD model with the CORRECT dimension (feature_dim, not 100)
-                svd = TruncatedSVD(n_components=feature_dim)
-                text_emb_reduced = svd.fit_transform(text_emb_np)
-                print(f"Reduced text embedding shape: {text_emb_reduced.shape}")
-                
-                # Normalize for cosine similarity
-                text_norm = np.sqrt(np.sum(text_emb_reduced ** 2, axis=1, keepdims=True))
-                img_norm = np.sqrt(np.sum(fake_img_features_np ** 2, axis=1, keepdims=True))
-                
-                text_embeddings_norm = text_emb_reduced / (text_norm + 1e-8)
-                fake_img_features_norm = fake_img_features_np / (img_norm + 1e-8)
-                
-                print(f"Normalized shapes - Images: {fake_img_features_norm.shape}, Text: {text_embeddings_norm.shape}")
-                
-                # Compute cosine similarity (directly as matrix multiplication is now aligned)
-                similarity = np.matmul(fake_img_features_norm, text_embeddings_norm.T)
-                print(f"Computed similarity matrix of shape {similarity.shape}")
-                
-            except Exception as e:
-                print(f"Error in SVD computation: {e}")
-                # If SVD fails for any reason, use simple dot product similarity
-                similarity = np.zeros((sample_size, sample_size))
-                
-                # Compute a direct feature-by-feature dot product
-                print("Using direct feature-wise similarity calculation")
-                for i in range(sample_size):
-                    for j in range(sample_size):
-                        # Compute cosine similarity directly
-                        v1 = fake_img_features_np[i] / (np.linalg.norm(fake_img_features_np[i]) + 1e-8)
-                        v2 = text_emb_np[j] / (np.linalg.norm(text_emb_np[j]) + 1e-8)
-                        
-                        # Take dot product of common parts (use the smaller dimension)
-                        min_dim = min(v1.shape[0], v2.shape[0])
-                        similarity[i, j] = np.dot(v1[:min_dim], v2[:min_dim])
-                
-            # For each image, find if the matching text is in top k results
-            correct_matches = 0
-            for i in range(sample_size):
-                # Get the scores for the current image with all texts
-                scores = similarity[i]
-                # Get the indices of the top k most similar texts
-                top_indices = np.argsort(scores)[-k:]
-                # Check if the true match (index i) is in the top k
-                if i in top_indices:
-                    correct_matches += 1
-            
-            # Clean up
-            del fake_img_features, text_embeddings_subset, fake_images_subset
-            del text_emb_np, fake_img_features_np, text_embeddings_norm, fake_img_features_norm
-            if 'text_emb_reduced' in locals():
-                del text_emb_reduced
-            import gc
-            gc.collect()
-            
-            r_precision = correct_matches / sample_size
-            return float(r_precision)
-            
-        except Exception as e:
-            print(f"Error computing R-precision: {e}")
-            import traceback
-            traceback.print_exc()
-            return float('nan')
-
-
-class Stage1Trainer:
-    def __init__(self, config):
-        self.config = config
+        self.device = config.DEVICE
         self.checkpoint_dir = os.path.join('checkpoints', config.DATASET_NAME)
         self.sample_dir = os.path.join('samples', config.DATASET_NAME)
-        # Create directories if they don't exist
+        self.metrics_dir = os.path.join('metrics', config.DATASET_NAME)
+        
+        # Create directories
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.sample_dir, exist_ok=True)
-        # Initialize models:
-        self.generator = StageIGenerator(config)
-        self.discriminator = StageIDiscriminator(config)
-        # Initialize optimizers
-        self.g_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=config.STAGE1_G_LR, beta_1=config.BETA1, beta_2=config.BETA2
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        
+        # Initialize models
+        self.generator = StageIGenerator(config).to(self.device)
+        self.discriminator = StageIDiscriminator(config).to(self.device)
+        
+        # Initialize optimizers as in paper (Adam with beta1=0.5, beta2=0.999)
+        self.g_optimizer = optim.Adam(
+            self.generator.parameters(),
+            lr=config.STAGE1_G_LR,
+            betas=(config.BETA1, config.BETA2)
         )
-        self.d_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=config.STAGE1_D_LR, beta_1=config.BETA1, beta_2=config.BETA2
+        self.d_optimizer = optim.Adam(
+            self.discriminator.parameters(),
+            lr=config.STAGE1_D_LR,
+            betas=(config.BETA1, config.BETA2)
         )
+        
         # Create fixed noise vector for visualization
-        self.fixed_noise = tf.random.normal([config.NUM_EXAMPLES, config.Z_DIM])
+        self.fixed_noise = torch.randn(config.NUM_EXAMPLES, config.Z_DIM, device=self.device)
+        
         # Initialize metrics tracking
         self.metrics = {
-            'train': {
-                'g_losses': [],
-                'd_losses': [],
-                'kl_losses': [],
-                'fid_scores': [],
-                'inception_scores': [],
-                'r_precision': []
-            },
-            'val': {
-                'g_losses': [],
-                'd_losses': [],
-                'kl_losses': [],
-                'fid_scores': [],
-                'inception_scores': [],
-                'r_precision': []
-            }
+            'g_losses': [],
+            'd_losses': [],
+            'kl_losses': [],
+            'fid_scores': [],
+            'inception_scores': [],
+            'r_precision': []
         }
+        
         # Initialize metrics calculator
-        self.metrics_calculator = GANMetrics(config)
+        print("Initializing metrics calculator (models will be loaded when needed)")
+        self.metrics_calculator = GANMetrics(config, lazy_load=True)
+        
         # Create log directory
         self.log_dir = os.path.join('logs', config.DATASET_NAME)
         os.makedirs(self.log_dir, exist_ok=True)
-
-    @tf.function
-    def train_generator(self, embeddings, noise):
-        # Ensure embeddings have the right shape (should be 2D)
-        if len(embeddings.shape) > 2:
-            embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
-        with tf.GradientTape() as tape:
-            # Generate fake images
-            fake_images, kl_loss = self.generator([noise, embeddings], training=True)
-            # Compute discriminator outputs for fake images
-            fake_logits = self.discriminator([fake_images, embeddings], training=True)
-            # Calculate generator loss
-            g_loss = -tf.reduce_mean(fake_logits)
-            # Add KL divergence loss
-            total_loss = g_loss + self.config.LAMBDA * kl_loss
-        # Compute gradients and update generator
-        gradients = tape.gradient(total_loss, self.generator.trainable_variables)
-        self.g_optimizer.apply_gradients(zip(gradients, self.generator.trainable_variables))
-        return g_loss, kl_loss
-
-    @tf.function
+        
+        print("Trainer initialization complete")
+    
     def train_discriminator(self, real_images, embeddings, noise):
-        # Ensure embeddings have the right shape (should be 2D)
-        if len(embeddings.shape) > 2:
-            embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
-        with tf.GradientTape() as tape:
-            # Generate fake images
-            fake_images, _ = self.generator([noise, embeddings], training=True)
-            # Compute discriminator outputs for real and fake images
-            real_logits = self.discriminator([real_images, embeddings], training=True)
-            fake_logits = self.discriminator([fake_images, embeddings], training=True)
-            # Calculate discriminator loss (Wasserstein loss)
-            d_loss_real = -tf.reduce_mean(real_logits)
-            d_loss_fake = tf.reduce_mean(fake_logits)
-            d_loss = d_loss_real + d_loss_fake
-            # Add gradient penalty (WGAN-GP)
-            alpha = tf.random.uniform([real_images.shape[0], 1, 1, 1], 0., 1.)
-            interpolated = alpha * real_images + (1 - alpha) * fake_images
-            with tf.GradientTape() as gp_tape:
-                gp_tape.watch(interpolated)
-                interp_logits = self.discriminator([interpolated, embeddings], training=True)
-            grads = gp_tape.gradient(interp_logits, interpolated)
-            grad_norms = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
-            gradient_penalty = tf.reduce_mean(tf.square(grad_norms - 1.0))
-            d_loss += 10.0 * gradient_penalty
-        # Compute gradients and update discriminator
-        gradients = tape.gradient(d_loss, self.discriminator.trainable_variables)
-        self.d_optimizer.apply_gradients(zip(gradients, self.discriminator.trainable_variables))
-        return d_loss
-
-    @tf.function
-    def calculate_losses(self, real_images, embeddings, noise, training=True):
-        """Calculate losses without updating weights (for validation)"""
-        # Ensure embeddings have the right shape (should be 2D)
-        if len(embeddings.shape) > 2:
-            embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
+        """Train the discriminator for one step using binary cross-entropy loss as in original GAN paper"""
+        self.d_optimizer.zero_grad()
+        
+        batch_size = real_images.size(0)
+        
         # Generate fake images
-        fake_images, kl_loss = self.generator([noise, embeddings], training=False)  # training=False prevents BatchNorm updates
-        # Compute discriminator outputs
-        real_logits = self.discriminator([real_images, embeddings], training=False)  # training=False here too
-        fake_logits = self.discriminator([fake_images, embeddings], training=False)
-        # Calculate losses the same way as in training for consistent measurement
-        g_loss = -tf.reduce_mean(fake_logits)
-        total_g_loss = g_loss + self.config.LAMBDA * kl_loss
-        d_loss_real = -tf.reduce_mean(real_logits)
-        d_loss_fake = tf.reduce_mean(fake_logits)
+        fake_images, _ = self.generator(noise, embeddings)
+        
+        # Real images: label = 1
+        real_labels = torch.ones(batch_size, device=self.device)
+        real_logits = self.discriminator(real_images, embeddings)
+        d_loss_real = F.binary_cross_entropy(real_logits, real_labels)
+        
+        # Fake images: label = 0
+        fake_labels = torch.zeros(batch_size, device=self.device)
+        fake_logits = self.discriminator(fake_images.detach(), embeddings)
+        d_loss_fake = F.binary_cross_entropy(fake_logits, fake_labels)
+        
+        # Total discriminator loss
         d_loss = d_loss_real + d_loss_fake
-        return {
-            'g_loss': g_loss,
-            'd_loss': d_loss,
-            'kl_loss': kl_loss,
-            'total_g_loss': total_g_loss
-        }
+        
+        # Backpropagation and optimization
+        d_loss.backward()
+        self.d_optimizer.step()
+        
+        return d_loss.item()
+    
+    def train_generator(self, embeddings, noise):
+        """Train the generator for one step using binary cross-entropy loss + KL divergence regularization"""
+        self.g_optimizer.zero_grad()
+        
+        batch_size = embeddings.size(0)
+        
+        # Generate fake images
+        fake_images, kl_loss = self.generator(noise, embeddings)
+        
+        # Compute generator loss - fool the discriminator
+        real_labels = torch.ones(batch_size, device=self.device)
+        fake_logits = self.discriminator(fake_images, embeddings)
+        g_loss = F.binary_cross_entropy(fake_logits, real_labels)
+        
+        # Add KL divergence loss with lambda regularization as in paper
+        total_loss = g_loss + self.config.LAMBDA * kl_loss
+        
+        # Backpropagation and optimization
+        total_loss.backward()
+        self.g_optimizer.step()
+        
+        return g_loss.item(), kl_loss.item()
+    
+    def save_samples(self, epoch, fixed_embeddings):
+        """Save sample generated images for visualization"""
+        self.generator.eval()
+        with torch.no_grad():
+            fake_images, _ = self.generator(self.fixed_noise, fixed_embeddings)
+            
+            # Convert to numpy and denormalize
+            fake_images = fake_images.cpu().numpy()
+            fake_images = (fake_images + 1) / 2.0  # [-1, 1] -> [0, 1]
+            
+            # Save as grid
+            fig, axs = plt.subplots(2, 3, figsize=(12, 8))
+            for i, ax in enumerate(axs.flatten()):
+                if i < fake_images.shape[0]:
+                    ax.imshow(np.transpose(fake_images[i], (1, 2, 0)))
+                    ax.axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.sample_dir, f'samples_epoch_{epoch+1}.png'))
+            plt.close()
+        self.generator.train()
+    
+    def compute_metrics(self, epoch, real_images, text_embeddings, num_samples=500, is_validation=False):
+        """Compute evaluation metrics"""
+        phase = "validation" if is_validation else "training"
+        
+        # Generate fake images for metrics calculation
+        self.generator.eval()
+        with torch.no_grad():
+            # Sample random noise and text embeddings
+            noise = torch.randn(num_samples, self.config.Z_DIM, device=self.device)
+            sampled_embeddings = text_embeddings[:num_samples].to(self.device)
+            
+            # Generate fake images
+            fake_images, _ = self.generator(noise, sampled_embeddings)
+            
+            # Move to CPU for metrics calculation
+            fake_images = fake_images.cpu()
+            real_images_sample = real_images[:num_samples].cpu()
+            
+            # Initialize metrics values
+            fid_score = float('inf')
+            is_mean = 0.0
+            r_precision = 0.0
+            
+            # Calculate FID score and Inception Score only for validation
+            if is_validation:
+                try:
+                    fid_score = self.metrics_calculator.calculate_fid(real_images_sample, fake_images)
+                    self.metrics['fid_scores'].append(fid_score)
+                except Exception as e:
+                    print(f"Error calculating FID score: {e}")
+                
+                try:
+                    is_mean, is_std = self.metrics_calculator.calculate_inception_score(fake_images)
+                    self.metrics['inception_scores'].append(is_mean)
+                except Exception as e:
+                    print(f"Error calculating Inception Score: {e}")
+            
+            # Calculate R-precision for both training and validation
+            try:
+                # Calculate R-precision
+                r_precision = self.metrics_calculator.calculate_r_precision(
+                    fake_images.detach().cpu().numpy(),
+                    text_embeddings[:num_samples].cpu().numpy(),
+                    k=self.config.R_PRECISION_K
+                )
+                if is_validation:
+                    self.metrics['r_precision'].append(r_precision)
+            except Exception as e:
+                print(f"Error calculating R-precision: {e}")
+            
+            # Print metrics in the requested format for validation
+            if is_validation:
+                print(f"Epoch {epoch} (validation) : Inception Score: {is_mean:.4f}, FID: {fid_score:.4f}, R-squared-precision: {r_precision:.4f}")
+        
+        self.generator.train()
+    
+    def plot_metrics(self, epoch):
+        """Plot and save metrics"""
+        # Only plot if we have enough data
+        if len(self.metrics['g_losses']) < 2:
+            return
+            
+        # Create directory
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        
+        # Plot losses
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 3, 1)
+        plt.plot(self.metrics['g_losses'], label='Generator')
+        plt.plot(self.metrics['d_losses'], label='Discriminator')
+        plt.title('GAN Losses')
+        plt.legend()
+        
+        plt.subplot(1, 3, 2)
+        plt.plot(self.metrics['kl_losses'], label='KL Divergence')
+        plt.title('KL Divergence Loss')
+        plt.legend()
+        
+        # Plot evaluation metrics if available
+        if len(self.metrics['fid_scores']) > 0:
+            plt.subplot(1, 3, 3)
+            plt.plot(self.metrics['fid_scores'], label='FID Score')
+            plt.title('FID Score (lower is better)')
+            plt.legend()
+            
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.metrics_dir, f'metrics_epoch_{epoch+1}.png'))
+        plt.close()
+        
+        # Save metrics as pickle
+        with open(os.path.join(self.metrics_dir, 'metrics.pkl'), 'wb') as f:
+            pickle.dump(self.metrics, f)
 
-    def validate(self, val_dataset):
-        """Validate the model on the validation dataset"""
-        print("Running validation...")
+    def save_checkpoint(self, epoch, global_step=0, is_best=False):
+        """Save comprehensive checkpoint for resuming training"""
+        checkpoint_dir = os.path.join('checkpoints', self.config.DATASET_NAME)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        checkpoint = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'generator_state': self.generator.state_dict(),
+            'discriminator_state': self.discriminator.state_dict(),
+            'g_optimizer_state': self.g_optimizer.state_dict(),
+            'd_optimizer_state': self.d_optimizer.state_dict(),
+            'metrics': self.metrics,
+            'fixed_noise': self.fixed_noise,
+            'timestamp': time.time()
+        }
+        
+        # Save regular checkpoint
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint at epoch {epoch} to {checkpoint_path}")
+        
+        # Save latest checkpoint (for resuming)
+        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        torch.save(checkpoint, latest_path)
+        
+        # Save best model if this is the best one
+        if is_best:
+            best_path = os.path.join(checkpoint_dir, 'best_model.pt')
+            torch.save(checkpoint, best_path)
+            print(f"Saved best model checkpoint to {best_path}")
+            
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint to resume training"""
+        if not os.path.exists(checkpoint_path):
+            print(f"Checkpoint not found at {checkpoint_path}")
+            return False
+            
+        try:
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model states
+            self.generator.load_state_dict(checkpoint['generator_state'])
+            self.discriminator.load_state_dict(checkpoint['discriminator_state'])
+            
+            # Load optimizer states
+            self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
+            self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
+            
+            # Load metrics history
+            self.metrics = checkpoint['metrics']
+            
+            # Load fixed noise for continuity in visualization
+            if 'fixed_noise' in checkpoint:
+                self.fixed_noise = checkpoint['fixed_noise']
+            
+            # Return the epoch and step to resume from
+            return checkpoint['epoch'], checkpoint.get('global_step', 0)
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            return False
+
+def save_model(model, path):
+    """Save model weights"""
+    torch.save(model.state_dict(), path)
+
+def load_model(model, path):
+    """Load model weights"""
+    model.load_state_dict(torch.load(path, map_location=model.device))
+
+def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
+    """Training function for Stage-I GAN with checkpoint support"""
+    print(f"Training on device: {config.DEVICE}")
+    
+    # Create data manager
+    data_manager = DataManager(config)
+    
+    # Get training and validation data loaders
+    train_loader, train_size = data_manager.get_data()
+    val_loader, val_size = data_manager.get_test_data()
+    
+    print(f"Training dataset size: {train_size}")
+    print(f"Validation dataset size: {val_size}")
+    
+    # Create trainer
+    trainer = GANTrainer(config)
+    
+    # Initialize tracking variables
+    start_epoch = 0
+    global_step = 0
+    
+    # Resume from checkpoint if specified
+    if resume_checkpoint:
+        resume_result = trainer.load_checkpoint(resume_checkpoint)
+        if resume_result:
+            start_epoch, global_step = resume_result
+            print(f"Resuming from epoch {start_epoch+1}, global step {global_step}")
+    
+    # Visualize samples only if starting fresh
+    if start_epoch == 0:
+        data_manager.visualize_samples(num_samples=3)
+    
+    # Get fixed embeddings for visualization
+    fixed_embeddings = None
+    real_images_sample = None  # For metrics calculation
+    text_embeddings_sample = None  # For metrics calculation
+    for real_images, embeddings in train_loader:
+        # Store fixed examples for visualization
+        fixed_embeddings = embeddings[:config.NUM_EXAMPLES].to(config.DEVICE)
+        # Store samples for metrics calculation
+        real_images_sample = real_images
+        text_embeddings_sample = embeddings
+        break
+    
+    # Start training loop
+    steps_per_epoch = train_size // config.BATCH_SIZE
+    print(f"Steps per epoch: {steps_per_epoch}")
+    
+    print("\n======= Starting training =======\n")
+    for epoch in range(start_epoch, num_epochs):
+        epoch_start_time = time.time()
+        print(f"\n===== EPOCH {epoch+1}/{num_epochs} =====")
+        
+        # Training phase
+        trainer.generator.train()
+        trainer.discriminator.train()
+        
         g_losses = []
         d_losses = []
         kl_losses = []
-        for step, (real_images, embeddings) in enumerate(val_dataset):
-            batch_size = real_images.shape[0]
-            noise = tf.random.normal([batch_size, self.config.Z_DIM])
-            # Calculate losses without updating weights
-            losses = self.calculate_losses(real_images, embeddings, noise, training=False)
-            g_losses.append(losses['g_loss'])
-            d_losses.append(losses['d_loss'])
-            kl_losses.append(losses['kl_loss'])
-            if (step + 1) % 5 == 0:
-                print(f"  Validation Step {step+1}, "
-                      f"G Loss: {losses['g_loss']:.4f}, D Loss: {losses['d_loss']:.4f}, "
-                      f"KL Loss: {losses['kl_loss']:.4f}")
-        # Calculate averages
-        avg_g_loss = tf.reduce_mean(g_losses).numpy()
-        avg_d_loss = tf.reduce_mean(d_losses).numpy()
-        avg_kl_loss = tf.reduce_mean(kl_losses).numpy()
-        print(f"Validation Loss Results: G Loss: {avg_g_loss:.4f}, "
-              f"D Loss: {avg_d_loss:.4f}, KL Loss: {avg_kl_loss:.4f}")
-        # Store validation metrics
-        self.metrics['val']['g_losses'].append(avg_g_loss)
-        self.metrics['val']['d_losses'].append(avg_d_loss)
-        self.metrics['val']['kl_losses'].append(avg_kl_loss)
-        return avg_g_loss, avg_d_loss, avg_kl_loss
-
-    def save_samples(self, epoch, embeddings):
-        # Ensure embeddings have the right shape
-        if len(embeddings.shape) > 2:
-            embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
-        # Generate images
-        fake_images, _ = self.generator([self.fixed_noise, embeddings], training=False)
-        # Save images
-        save_path = os.path.join(self.sample_dir, f'stage1_epoch_{epoch}.png')
-        save_images(fake_images, save_path)
-
-    def plot_metrics(self, epoch):
-        """Plot training and validation metrics"""
-        epochs = list(range(1, epoch + 2))
-        plt.figure(figsize=(15, 5))
-        # Generator loss
-        plt.subplot(1, 3, 1)
-        plt.plot(epochs, self.metrics['train']['g_losses'], 'b-', label='Training')
-        plt.plot(epochs, self.metrics['val']['g_losses'], 'r-', label='Validation')
-        plt.title('Generator Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        # Discriminator loss
-        plt.subplot(1, 3, 2)
-        plt.plot(epochs, self.metrics['train']['d_losses'], 'b-', label='Training')
-        plt.plot(epochs, self.metrics['val']['d_losses'], 'r-', label='Validation')
-        plt.title('Discriminator Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        # KL loss
-        plt.subplot(1, 3, 3)
-        plt.plot(epochs, self.metrics['train']['kl_losses'], 'b-', label='Training')
-        plt.plot(epochs, self.metrics['val']['kl_losses'], 'r-', label='Validation')
-        plt.title('KL Divergence Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.log_dir, f'metrics_epoch_{epoch}.png'))
-        plt.close()
-
-    def compute_and_log_metrics(self, epoch, dataset, split='train'):
-        """Compute advanced metrics from the StackGAN paper and log them"""
-        print(f"Computing {split} metrics for epoch {epoch+1}...")
         
-        # Limit the amount of data we collect to avoid OOM
-        max_samples = min(self.config.FID_SAMPLE_SIZE, 500)  # Reduced from 1000 to 500
-        print(f"Using {max_samples} samples for metrics calculation (reduced to prevent OOM)")
+        for step, (real_images, embeddings) in enumerate(train_loader):
+            global_step += 1
+            
+            # Move data to device
+            real_images = real_images.to(config.DEVICE)
+            embeddings = embeddings.to(config.DEVICE)
+            
+            batch_size = real_images.size(0)
+            
+            # Train discriminator
+            noise = torch.randn(batch_size, config.Z_DIM, device=config.DEVICE)
+            d_loss = trainer.train_discriminator(real_images, embeddings, noise)
+            d_losses.append(d_loss)
+            
+            # Train generator
+            noise = torch.randn(batch_size, config.Z_DIM, device=config.DEVICE)
+            g_loss, kl_loss = trainer.train_generator(embeddings, noise)
+            g_losses.append(g_loss)
+            kl_losses.append(kl_loss)
+            
+            # Print progress
+            
         
-        # Collect real images and text embeddings
-        real_images_list = []
-        embeddings_list = []
-        fake_images_list = []
-        sample_count = 0
+        # Calculate epoch average losses
+        g_loss_avg = np.mean(g_losses)
+        d_loss_avg = np.mean(d_losses)
+        kl_loss_avg = np.mean(kl_losses)
         
-        print(f"Collecting {max_samples} samples for metrics calculation...")
-        for real_images, embeddings in dataset:
-            if sample_count >= max_samples:
+        # Store metrics
+        trainer.metrics['g_losses'].append(g_loss_avg)
+        trainer.metrics['d_losses'].append(d_loss_avg)
+        trainer.metrics['kl_losses'].append(kl_loss_avg)
+        
+        # Print epoch training summary in the requested format
+        print(f"Epoch {epoch+1} (training) : Gen loss: {g_loss_avg:.4f}, disc loss: {d_loss_avg:.4f}, KL: {kl_loss_avg:.4f}")
+        
+        # Compute evaluation metrics periodically if not skipped
+        if not skip_metrics and (epoch + 1) % config.EVAL_INTERVAL == 0:
+            # Get validation samples
+            val_real_images = None
+            val_text_embeddings = None
+            for val_real_imgs, val_embeddings in val_loader:
+                val_real_images = val_real_imgs
+                val_text_embeddings = val_embeddings
                 break
                 
-            batch_size = real_images.shape[0]
-            # Generate fake images
-            noise = tf.random.normal([batch_size, self.config.Z_DIM])
-            if len(embeddings.shape) > 2:
-                embeddings = tf.reshape(embeddings, [tf.shape(embeddings)[0], -1])
+            trainer.compute_metrics(epoch + 1, val_real_images, val_text_embeddings, 
+                                  num_samples=min(500, len(val_real_images)), 
+                                  is_validation=True)
+        
+        # Save generated samples
+        trainer.save_samples(epoch, fixed_embeddings)
+        
+        # Plot metrics
+        trainer.plot_metrics(epoch)
+        
+        # Determine if this is the best model based on FID score (lower is better)
+        is_best = False
+        if len(trainer.metrics['fid_scores']) > 0:
+            current_fid = trainer.metrics['fid_scores'][-1]
+            if len(trainer.metrics['fid_scores']) == 1 or current_fid < min(trainer.metrics['fid_scores'][:-1]):
+                is_best = True
                 
-            fake_images, _ = self.generator([noise, embeddings], training=False)
-            
-            # Append to lists
-            real_images_list.append(real_images)
-            embeddings_list.append(embeddings)
-            fake_images_list.append(fake_images)
-            sample_count += batch_size
-            
-            # Print progress periodically
-            if sample_count % 100 == 0:
-                print(f"  Collected {sample_count}/{max_samples} samples")
-                
-            # Force garbage collection to free memory
-            if sample_count % 200 == 0:
-                import gc
-                gc.collect()
-                
-        print(f"Processing collected samples...")
-        # Concatenate all collected samples
-        real_images_concat = tf.concat(real_images_list, axis=0)
-        embeddings_concat = tf.concat(embeddings_list, axis=0)
-        fake_images_concat = tf.concat(fake_images_list, axis=0)
+        # Save checkpoint
+        trainer.save_checkpoint(epoch + 1, global_step, is_best)
         
-        # Trim to exact sample size
-        real_images_concat = real_images_concat[:max_samples]
-        embeddings_concat = embeddings_concat[:max_samples]
-        fake_images_concat = fake_images_concat[:max_samples]
-        
-        print(f"Sample dimensions: Real: {real_images_concat.shape}, "
-              f"Fake: {fake_images_concat.shape}, Embeddings: {embeddings_concat.shape}")
-        
-        # Initialize metrics dict to store results
-        metrics_results = {
-            'fid': float('nan'),
-            'is_mean': float('nan'),
-            'is_std': float('nan'),
-            'r_precision': float('nan')
-        }
-        
-        # Free memory after concatenation
-        del real_images_list, embeddings_list, fake_images_list
-        import gc
-        gc.collect()
-        
-        # Compute metrics one by one with memory cleanup between each
-        
-        # Compute FID - a key metric from the StackGAN paper
-        if self.config.COMPUTE_FID:
-            try:
-                fid_score = self.metrics_calculator.compute_fid(real_images_concat, fake_images_concat)
-                self.metrics[split]['fid_scores'].append(fid_score)
-                metrics_results['fid'] = fid_score
-                print(f"  {split.capitalize()} FID Score: {fid_score:.4f}")
-            except Exception as e:
-                print(f"Error computing FID: {e}")
-                self.metrics[split]['fid_scores'].append(float('nan'))
-            # Force garbage collection
-            gc.collect()
-        
-        # Compute Inception Score - also used in the StackGAN paper
-        if self.config.COMPUTE_IS:
-            try:
-                is_mean, is_std = self.metrics_calculator.compute_inception_score(
-                    fake_images_concat, splits=self.config.IS_SPLITS)
-                self.metrics[split]['inception_scores'].append(is_mean)
-                metrics_results['is_mean'] = is_mean
-                metrics_results['is_std'] = is_std
-                print(f"  {split.capitalize()} Inception Score: {is_mean:.4f} ± {is_std:.4f}")
-            except Exception as e:
-                print(f"Error computing Inception Score: {e}")
-                self.metrics[split]['inception_scores'].append(float('nan'))
-            # Force garbage collection
-            gc.collect()
-        
-        # Compute R-precision for text-image matching - a metric mentioned in the paper
-        if self.config.COMPUTE_RPRECISION:
-            try:
-                r_precision = self.metrics_calculator.compute_r_precision(
-                    real_images_concat, fake_images_concat, embeddings_concat)
-                self.metrics[split]['r_precision'].append(r_precision)
-                metrics_results['r_precision'] = r_precision
-                print(f"  {split.capitalize()} R-precision: {r_precision:.4f}")
-            except Exception as e:
-                print(f"Error computing R-precision: {e}")
-                self.metrics[split]['r_precision'].append(float('nan'))
-            # Force garbage collection
-            gc.collect()
+        # Print epoch summary
+        epoch_time = time.time() - epoch_start_time
+        print(f"\nEpoch {epoch+1} completed in {epoch_time:.2f}s")
+        print(f"Average losses - G: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL: {kl_loss_avg:.4f}")
+    
+    print("\n======= Training Complete =======")
+    
+    # Final evaluation if not skipped
+    if not skip_metrics:
+        print("\n======= Final Evaluation =======\n")
+        # Get validation samples
+        val_real_images = None
+        val_text_embeddings = None
+        for val_real_imgs, val_embeddings in val_loader:
+            val_real_images = val_real_imgs
+            val_text_embeddings = val_embeddings
+            break
             
-        # Save sample of generated images for visual inspection
-        if fake_images_concat.shape[0] > 0:
-            sample_path = os.path.join(self.sample_dir, f'{split}_samples_epoch_{epoch+1}.png')
-            save_images(fake_images_concat[:16], sample_path)  # Save first 16 images
-            print(f"  Saved sample images to {sample_path}")
-            
-        # Clean up to free memory
-        del real_images_concat, embeddings_concat, fake_images_concat
-        gc.collect()
-            
-        # Return the metrics results for summary display
-        return metrics_results
-
-    def plot_advanced_metrics(self, epoch):
-        """Plot advanced metrics"""
-        epochs = list(range(1, epoch + 2))
-        plt.figure(figsize=(15, 10))
-        # FID Score
-        plt.subplot(2, 2, 1)
-        if len(self.metrics['train']['fid_scores']) > 0:
-            plt.plot(epochs, self.metrics['train']['fid_scores'], 'b-', label='Training')
-        if len(self.metrics['val']['fid_scores']) > 0:
-            plt.plot(epochs, self.metrics['val']['fid_scores'], 'r-', label='Validation')
-        plt.title('FID Score (lower is better)')
-        plt.xlabel('Epoch')
-        plt.ylabel('FID')
-        plt.legend()
-        # Inception Score
-        plt.subplot(2, 2, 2)
-        if len(self.metrics['train']['inception_scores']) > 0:
-            plt.plot(epochs, self.metrics['train']['inception_scores'], 'b-', label='Training')
-        if len(self.metrics['val']['inception_scores']) > 0:
-            plt.plot(epochs, self.metrics['val']['inception_scores'], 'r-', label='Validation')
-        plt.title('Inception Score (higher is better)')
-        plt.xlabel('Epoch')
-        plt.ylabel('IS')
-        plt.legend()
-        # R-precision
-        if self.config.COMPUTE_RPRECISION:
-            plt.subplot(2, 2, 3)
-            if len(self.metrics['train']['r_precision']) > 0:
-                plt.plot(epochs, self.metrics['train']['r_precision'], 'b-', label='Training')
-            if len(self.metrics['val']['r_precision']) > 0:
-                plt.plot(epochs, self.metrics['val']['r_precision'], 'r-', label='Validation')
-            plt.title('R-precision (higher is better)')
-            plt.xlabel('Epoch')
-            plt.ylabel('R-precision')
-            plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.log_dir, f'advanced_metrics_epoch_{epoch}.png'))
-        plt.close()
-
-    def train(self, train_dataset, val_dataset, train_size, val_size):
-        steps_per_epoch = train_size // self.config.BATCH_SIZE
-        # Get fixed embeddings for visualization
-        for _, embeddings in train_dataset.take(1):
-            fixed_embeddings = embeddings[:self.config.NUM_EXAMPLES]
-            # Ensure fixed embeddings have the right shape
-            if len(fixed_embeddings.shape) > 2:
-                fixed_embeddings = tf.reshape(fixed_embeddings, [self.config.NUM_EXAMPLES, -1])
-        
-        print("\n======= Starting training =======\n")
-        # Start training
-        for epoch in range(self.config.EPOCHS):
-            epoch_start_time = time.time()
-            print(f"\n===== EPOCH {epoch+1}/{self.config.EPOCHS} =====")
-            
-            # ===== TRAINING PHASE =====
-            print(f"\n----- Training Phase -----")
-            train_start_time = time.time()
-            
-            # Initialize metrics
-            g_losses = []
-            d_losses = []
-            kl_losses = []
-            
-            # Train loop
-            for step, (real_images, embeddings) in enumerate(train_dataset):
-                batch_size = real_images.shape[0]
-                
-                # Train discriminator
-                noise = tf.random.normal([batch_size, self.config.Z_DIM])
-                d_loss = self.train_discriminator(real_images, embeddings, noise)
-                d_losses.append(d_loss)
-                
-                # Train generator
-                noise = tf.random.normal([batch_size, self.config.Z_DIM])
-                g_loss, kl_loss = self.train_generator(embeddings, noise)
-                g_losses.append(g_loss)
-                kl_losses.append(kl_loss)
-                
-                # Print progress
-                if (step + 1) % 10 == 0:
-                    print(f"  Step {step+1}/{steps_per_epoch}, "
-                          f"G Loss: {g_loss:.4f}, D Loss: {d_loss:.4f}, KL Loss: {kl_loss:.4f}")
-            
-            # Calculate epoch averages for training
-            g_loss_avg = tf.reduce_mean(g_losses).numpy()
-            d_loss_avg = tf.reduce_mean(d_losses).numpy()
-            kl_loss_avg = tf.reduce_mean(kl_losses).numpy()
-            
-            # Store training metrics
-            self.metrics['train']['g_losses'].append(g_loss_avg)
-            self.metrics['train']['d_losses'].append(d_loss_avg)
-            self.metrics['train']['kl_losses'].append(kl_loss_avg)
-            
-            train_time = time.time() - train_start_time
-            print(f"\nTraining Results (Epoch {epoch+1}): "
-                  f"G Loss: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL Loss: {kl_loss_avg:.4f}, "
-                  f"Time: {train_time:.2f}s")
-            
-            # ===== TRAINING EVALUATION =====
-            print(f"\n----- Training Evaluation -----")
-            metrics_start_time = time.time()
-            train_metrics = self.compute_and_log_metrics(epoch, train_dataset, split='train')
-            metrics_time = time.time() - metrics_start_time
-            
-            # Display comprehensive training metrics summary including FID and IS
-            print(f"\nTraining Metrics Summary (Epoch {epoch+1}):")
-            print(f"  Losses: G Loss: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL Loss: {kl_loss_avg:.4f}")
-            print(f"  Quality: FID Score: {train_metrics['fid']:.4f} (lower is better)")
-            print(f"  Diversity: Inception Score: {train_metrics['is_mean']:.4f} ± {train_metrics['is_std']:.4f} (higher is better)")
-            print(f"  Text-Image Alignment: R-precision: {train_metrics['r_precision']:.4f} (higher is better)")
-            print(f"  Evaluation time: {metrics_time:.2f}s")
-            
-            # ===== VALIDATION PHASE =====
-            print(f"\n----- Validation Phase -----")
-            val_start_time = time.time()
-            val_g_loss, val_d_loss, val_kl_loss = self.validate(val_dataset)
-            
-            # Compute advanced metrics for validation set
-            val_metrics = self.compute_and_log_metrics(epoch, val_dataset, split='val')
-            val_time = time.time() - val_start_time
-            
-            # Display comprehensive validation metrics summary including FID and IS
-            print(f"\nValidation Metrics Summary (Epoch {epoch+1}):")
-            print(f"  Losses: G Loss: {val_g_loss:.4f}, D Loss: {val_d_loss:.4f}, KL Loss: {val_kl_loss:.4f}")
-            print(f"  Quality: FID Score: {val_metrics['fid']:.4f} (lower is better)")
-            print(f"  Diversity: Inception Score: {val_metrics['is_mean']:.4f} ± {val_metrics['is_std']:.4f} (higher is better)")
-            print(f"  Text-Image Alignment: R-precision: {val_metrics['r_precision']:.4f} (higher is better)")
-            print(f"  Validation time: {val_time:.2f}s")
-            
-            # ===== VISUALIZATION =====
-            print(f"\n----- Generating Visualizations -----")
-            vis_start_time = time.time()
-            
-            # Generate and save samples
-            self.save_samples(epoch, fixed_embeddings)
-            
-            # Generate text-to-image demonstration
-            self.generate_text_to_image_demo(epoch + 1, fixed_embeddings, train_dataset)
-            
-            # Plot metrics
-            self.plot_metrics(epoch)
-            self.plot_advanced_metrics(epoch)
-            
-            vis_time = time.time() - vis_start_time
-            print(f"Visualization time: {vis_time:.2f}s")
-            
-            # ===== CHECKPOINT SAVING =====
-            if (epoch + 1) % self.config.SNAPSHOT_INTERVAL == 0:
-                print(f"\n----- Saving Checkpoint -----")
-                checkpoint_start_time = time.time()
-                save_model(self.generator, os.path.join(self.checkpoint_dir, f'stage1_generator_{epoch+1}'))
-                save_model(self.discriminator, os.path.join(self.checkpoint_dir, f'stage1_discriminator_{epoch+1}'))
-                checkpoint_time = time.time() - checkpoint_start_time
-                print(f"Checkpoint saving time: {checkpoint_time:.2f}s")
-            
-            # ===== EPOCH SUMMARY =====
-            epoch_time = time.time() - epoch_start_time
-            print(f"\n===== Epoch {epoch+1} Summary =====")
-            print(f"  Training:   G Loss: {g_loss_avg:.4f}, D Loss: {d_loss_avg:.4f}, KL Loss: {kl_loss_avg:.4f}")
-            print(f"  Validation: G Loss: {val_g_loss:.4f}, D Loss: {val_d_loss:.4f}, KL Loss: {val_kl_loss:.4f}")
-            print(f"  Times: Training {train_time:.2f}s, Validation {val_time:.2f}s, Total {epoch_time:.2f}s")
-            print(f"  Memory: Preparing for next epoch (data loading and buffering)...")
-            
-            # A small sleep to allow the console to flush before next epoch starts
-            time.sleep(0.5)
-        
-        print("\n======= Training Complete =======\n")
-
-    def generate_text_to_image_demo(self, epoch, fixed_embeddings, train_dataset):
-        print(f"Generating text-to-image demonstration for epoch {epoch}...")
-        # Get random text embeddings and actual images from training data
-        demo_samples = []
-        for real_images, embeddings in train_dataset.take(1):
-            demo_samples = [(real_images[i].numpy(), embeddings[i].numpy()) for i in range(min(3, len(real_images)))]
-        # Create a figure to display real and generated images side by side
-        plt.figure(figsize=(12, 4 * len(demo_samples)))
-        for i, (real_image, embedding) in enumerate(demo_samples):
-            # Reshape embedding if needed
-            if len(embedding.shape) > 1:
-                embedding = embedding.flatten()
-            # Add batch dimension
-            embedding_batch = tf.expand_dims(embedding, 0)
-            # Generate noise
-            noise = tf.random.normal([1, self.config.Z_DIM])
-            # Generate image from text embedding
-            generated_image, _ = self.generator([noise, embedding_batch], training=False)
-            generated_image = generated_image[0].numpy()  # Remove batch dimension
-            # Display real and generated images side by side
-            plt.subplot(len(demo_samples), 2, i*2 + 1)
-            plt.imshow((real_image + 1) / 2.0)  # Convert from [-1,1] to [0,1]
-            plt.title(f"Real Image")
-            plt.axis('off')
-            plt.subplot(len(demo_samples), 2, i*2 + 2)
-            plt.imshow((generated_image + 1) / 2.0)  # Convert from [-1,1] to [0,1]
-            plt.title(f"Generated from Text Embedding")
-            plt.axis('off')
-        plt.tight_layout()
-        demo_path = os.path.join(self.sample_dir, f'text_to_image_demo_epoch_{epoch}.png')
-        plt.savefig(demo_path)
-        plt.close()
-        print(f"Text-to-image demonstration saved to {demo_path}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train Stage-I GAN')
-    parser.add_argument('--dataset', type=str, default='birds', 
-                        help='Dataset name (birds or flowers)')
-    parser.add_argument('--batch_size', type=int, default=64, 
-                        help='Batch size')
-    parser.add_argument('--epochs', type=int, default=600, 
-                        help='Number of epochs')
-    parser.add_argument('--gpu', type=str, default='0', 
-                        help='GPU to use')
-    parser.add_argument('--images_path', type=str, required=True,
-                        help='Path to the directory containing bird class folders with images')
-    parser.add_argument('--train_path', type=str, required=True,
-                        help='Path to the train directory with pickle files')
-    parser.add_argument('--test_path', type=str, required=True,
-                        help='Path to the test directory with pickle files')
-    return parser.parse_args()
-
+        trainer.compute_metrics(num_epochs, val_real_images, val_text_embeddings, 
+                              num_samples=min(1000, len(val_real_images)),
+                              is_validation=True)
 
 def main():
-    args = parse_args()
-    # Set GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    # Set up memory growth to avoid occupying all GPU memory
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-            print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
-        except RuntimeError as e:
-            print(e)
-    # Create configuration
-    config = Config()
-    config.DATASET_NAME = args.dataset
-    config.BATCH_SIZE = args.batch_size
-    config.EPOCHS = args.epochs
-    # Store all paths in a dictionary in LOCAL_DATASET_PATH
-    config.LOCAL_DATASET_PATH = {
-        'images': args.images_path,
-        'train': args.train_path,
-        'test': args.test_path
-    }
-    # Check if all paths exist
-    for path_type, path in config.LOCAL_DATASET_PATH.items():
-        if not os.path.exists(path):
-            raise ValueError(f"The {path_type} path does not exist: {path}")
-    print(f"Using dataset paths:")
-    print(f"  Images: {config.LOCAL_DATASET_PATH['images']}")
-    print(f"  Train: {config.LOCAL_DATASET_PATH['train']}")
-    print(f"  Test: {config.LOCAL_DATASET_PATH['test']}")
-    # Create dataset
-    dataset = Dataset(config)
-    # Visualize a few samples to verify text-image pairs are correctly processed
-    dataset.visualize_samples(num_samples=3)
-    # Get training and validation datasets
-    train_dataset, train_size = dataset.get_data()
-    val_dataset, val_size = dataset.get_test_data()
-    print(f"Training dataset size: {train_size}")
-    print(f"Validation dataset size: {val_size}")
-    # Create trainer
-    trainer = Stage1Trainer(config)
-    # Train Stage-I GAN with validation
-    print("Training Stage-I GAN with validation...")
-    trainer.train(train_dataset, val_dataset, train_size, val_size)
+    # Set your dataset paths here - FIXED THE DIRECTORY ASSIGNMENTS
+    images_path = "images"  # Directory containing bird class folders with images
+    train_path = "train"    # Correctly using train data for training
+    test_path = "test"      # Correctly using test data for validation
+    
+    config = Config(images_path, train_path, test_path)
+    
+    # Print key configuration values for verification
+    print("\nConfiguration:")
+    print(f"Embedding dimension: {config.EMBEDDING_DIM}")
+    print(f"Conditioning Augmentation dimension: {config.CA_DIM}")
+    print(f"Batch size: {config.BATCH_SIZE} (as per paper)")
+    print(f"Learning rate: {config.STAGE1_G_LR} (as per paper)")
+    print(f"Image size: {config.STAGE1_IMAGE_SIZE}x{config.STAGE1_IMAGE_SIZE} (as per paper)")
+    
+    # Add checkpoint support for resuming interrupted training
+    checkpoint_dir = os.path.join('checkpoints', config.DATASET_NAME)
+    resume_checkpoint = None
+    
+    if os.path.exists(checkpoint_dir):
+        # Check for latest checkpoint
+        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.exists(latest_path):
+            user_input = input(f"Found latest checkpoint at {latest_path}. Resume training? (y/n): ")
+            if user_input.lower() == 'y':
+                resume_checkpoint = latest_path
+        else:
+            # Find checkpoint with highest epoch number
+            checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_')]
+            if checkpoints:
+                # Sort by epoch number
+                checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                latest_checkpoint = os.path.join(checkpoint_dir, checkpoints[-1])
+                
+                user_input = input(f"Found checkpoint {latest_checkpoint}. Resume training? (y/n): ")
+                if user_input.lower() == 'y':
+                    resume_checkpoint = latest_checkpoint
+    
+    # Use the exact batch size from the paper
+    if torch.cuda.is_available():
+        print(f"Training on GPU: {torch.cuda.get_device_name(0)}")
+    
+    # Train with proper dataset configuration
+    train(config, num_epochs=config.EPOCHS, skip_metrics=False, resume_checkpoint=resume_checkpoint)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    # This is the important fix for the multiprocessing issue
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
+
+
+
