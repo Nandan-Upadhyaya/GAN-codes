@@ -19,14 +19,15 @@ import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
 
-# Print version information once
-print(f"PyTorch version: {torch.__version__}")
-print(f"Torchvision version: {torchvision.__version__}")
-print(f"NumPy version: {np.__version__}")
-print(f"SciPy version: {scipy.__version__}")
-print(f"Matplotlib version: {matplotlib.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
+if __name__ == '__main__':
+ print(f"PyTorch version: {torch.__version__}")
+ print(f"Torchvision version: {torchvision.__version__}")
+ print(f"NumPy version: {np.__version__}")
+ print(f"SciPy version: {scipy.__version__}")
+ print(f"Matplotlib version: {matplotlib.__version__}")
+ print(f"CUDA available: {torch.cuda.is_available()}")
+
+ if torch.cuda.is_available():
     print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
 # Set random seeds for reproducibility
@@ -53,7 +54,7 @@ class Config:
     # Training parameters from paper
     BATCH_SIZE = 128  # batch size from the StackGAN paper
     EPOCHS = 600      # total epochs for training
-    SNAPSHOT_INTERVAL = 5
+    SNAPSHOT_INTERVAL = 1
     NUM_EXAMPLES = 6  # number of examples to visualize
     
     # Conditioning Augmentation parameters as in paper
@@ -67,7 +68,7 @@ class Config:
     LAMBDA = 2.0   # paper value
     
     # Metrics parameters
-    EVAL_INTERVAL = 10
+    EVAL_INTERVAL = 1
     FID_SAMPLE_SIZE = 500
     INCEPTION_SAMPLE_SIZE = 500
     R_PRECISION_K = 5
@@ -1015,8 +1016,8 @@ def train(config, num_epochs=10, skip_metrics=False):
 def main():
     # Set your dataset paths here
     images_path = "images"  # Directory containing bird class folders with images
-    train_path = "test"    # Directory with training data embeddings
-    test_path = "train"      # Directory with test data embeddings
+    train_path = "train"    # Directory with training data embeddings
+    test_path = "test"      # Directory with test data embeddings
 
     config = Config(images_path, train_path, test_path)
     

@@ -9,10 +9,15 @@ import pickle
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from PIL import Image
+import scipy
+import torchvision
+import matplotlib
 
 from stage2_models import StageIIGenerator, StageIIDiscriminator
 from stage1 import StageIGenerator, Config, GANMetrics
 
+
+    
 class Stage2Trainer:
     def __init__(self, config, stage1_checkpoint=None):
         self.config = config
@@ -218,11 +223,15 @@ class Stage2Trainer:
             fake_images = fake_images.cpu()
             real_images_sample = real_images[:num_samples].cpu()
             
+            fid_score = None
+            is_mean = None
+            is_std = None
+            
             # Calculate FID score
             try:
                 fid_score = self.metrics_calculator.calculate_fid(real_images_sample, fake_images)
                 self.metrics['fid_scores'].append(fid_score)
-                print(f"FID Score: {fid_score:.4f}")
+                # Remove individual print statement
             except Exception as e:
                 print(f"Error calculating FID score: {e}")
             
@@ -230,22 +239,14 @@ class Stage2Trainer:
             try:
                 is_mean, is_std = self.metrics_calculator.calculate_inception_score(fake_images)
                 self.metrics['inception_scores'].append(is_mean)
-                print(f"Inception Score: {is_mean:.4f} ± {is_std:.4f}")
+                # Remove individual print statement
             except Exception as e:
                 print(f"Error calculating Inception Score: {e}")
             
-            # Calculate R-precision
-            try:
-                r_precision = self.metrics_calculator.calculate_r_precision(
-                    fake_images,
-                    text_embeddings[:num_samples].cpu(),
-                    k=self.config.R_PRECISION_K
-                )
-                self.metrics['r_precision'].append(r_precision)
-                print(f"R-precision: {r_precision:.4f}")
-            except Exception as e:
-                print(f"Error calculating R-precision: {e}")
-        
+            # Print metrics in a single line if available
+            if fid_score is not None and is_mean is not None:
+                print(f"Epoch {epoch} metrics: Inception Score: {is_mean:.4f} ± {is_std:.4f}, FID: {fid_score:.4f}")
+                
         self.generator.train()
     
     def save_checkpoint(self, epoch):
@@ -299,8 +300,17 @@ def resize_images(images, target_size):
     resized = F.interpolate(images, size=(target_size, target_size), mode='bilinear', align_corners=True)
     return resized
 
-def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=None, stage1_checkpoint=None):
-    """Main training function for Stage-II GAN"""
+def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=None, 
+                    stage1_checkpoint='best_model.pt', verbose=True):
+    # Only print system and configuration information if verbose is True
+    if verbose:
+        import torch
+        import torchvision
+        import numpy as np
+        import scipy
+        import matplotlib
+        
+    
     print(f"Training Stage-II GAN on device: {config.DEVICE}")
     
     # Create trainer with specified Stage-I checkpoint
@@ -308,13 +318,24 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
     
     # Handle resume training
     start_epoch = 0
+    checkpoint_dir = os.path.join('checkpoints', config.DATASET_NAME, 'stage2')
+    
+    # If specific checkpoint is provided, use it
     if resume_checkpoint:
-        checkpoint_path = os.path.join(trainer.checkpoint_dir, resume_checkpoint)
+        checkpoint_path = os.path.join(checkpoint_dir, resume_checkpoint)
         if os.path.exists(checkpoint_path):
             start_epoch = trainer.load_checkpoint(checkpoint_path)
             print(f"Resuming training from epoch {start_epoch+1}")
         else:
             print(f"Checkpoint {checkpoint_path} not found, starting from epoch 0")
+    # Otherwise, try to load the latest checkpoint automatically
+    else:
+        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.exists(latest_path):
+            start_epoch = trainer.load_checkpoint(latest_path)
+            print(f"Automatically resuming from latest checkpoint (epoch {start_epoch+1})")
+        else:
+            print("No checkpoint found, starting from epoch 0")
     
     # Get fixed embeddings and images for visualization
     fixed_embeddings = None
@@ -396,15 +417,11 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
         # Print training information
         print(f"Epoch {epoch+1} (training) : Gen loss: {g_loss_avg:.4f}, disc loss: {d_loss_avg:.4f}, KL: {kl_loss_avg:.4f}")
         
-        # Save generated samples
+        # Save generated samples after every epoch
         trainer.save_samples(epoch+1, fixed_embeddings)
         
         # Compute evaluation metrics periodically
         if (epoch + 1) % config.EVAL_INTERVAL == 0:
-            print("Calculating FID score...")
-            print("Calculating Inception Score...")
-            print("Calculating R-precision...")
-            
             trainer.compute_metrics(
                 epoch + 1,
                 real_images_sample.to(config.DEVICE),
@@ -412,12 +429,11 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
                 stage1_images_sample.to(config.DEVICE)
             )
             
-            # Print formatted metrics
-            if trainer.metrics['inception_scores'] and trainer.metrics['fid_scores'] and trainer.metrics['r_precision']:
+            # Fix conditional check to not require r_precision
+            if trainer.metrics['inception_scores'] and trainer.metrics['fid_scores']:
                 is_score = trainer.metrics['inception_scores'][-1]
                 fid_score = trainer.metrics['fid_scores'][-1]
-                r_prec = trainer.metrics['r_precision'][-1]
-                print(f"Epoch {epoch+1} (validation) : Inception Score: {is_score:.4f}, FID: {fid_score:.4f}, R-squared-precision: {r_prec:.4f}")
+                print(f"Epoch {epoch+1} (validation) : Inception Score: {is_score:.4f}, FID: {fid_score:.4f}")
         
         # Save model checkpoint
         if (epoch + 1) % config.SNAPSHOT_INTERVAL == 0 or epoch == total_epochs - 1:

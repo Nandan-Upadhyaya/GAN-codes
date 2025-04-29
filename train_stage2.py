@@ -1,9 +1,14 @@
+import matplotlib
+import numpy as np
+import scipy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import os
 import sys
+
+import torchvision
 
 from stage1 import Config, DataManager
 from stage2_trainer import train_stage2_gan
@@ -109,4 +114,14 @@ def main():
     train_stage2_gan(config, train_stage1_loader, train_stage2_loader, resume_checkpoint=args.resume, stage1_checkpoint=args.stage1_checkpoint)
 
 if __name__ == "__main__":
+    
+ print(f"PyTorch version: {torch.__version__}")
+ print(f"Torchvision version: {torchvision.__version__}")
+ print(f"NumPy version: {np.__version__}")
+ print(f"SciPy version: {scipy.__version__}")
+ print(f"Matplotlib version: {matplotlib.__version__}")
+ print(f"CUDA available: {torch.cuda.is_available()}")
+
+ if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
     main()
