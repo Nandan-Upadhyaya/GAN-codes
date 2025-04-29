@@ -19,16 +19,15 @@ import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
 
-# Only print version information in the main process
-if __name__ == "__main__":
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"Torchvision version: {torchvision.__version__}")
-    print(f"NumPy version: {np.__version__}")
-    print(f"SciPy version: {scipy.__version__}")
-    print(f"Matplotlib version: {matplotlib.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+# Print version information once
+print(f"PyTorch version: {torch.__version__}")
+print(f"Torchvision version: {torchvision.__version__}")
+print(f"NumPy version: {np.__version__}")
+print(f"SciPy version: {scipy.__version__}")
+print(f"Matplotlib version: {matplotlib.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
 # Set random seeds for reproducibility
 random.seed(123)
@@ -54,7 +53,7 @@ class Config:
     # Training parameters from paper
     BATCH_SIZE = 128  # batch size from the StackGAN paper
     EPOCHS = 600      # total epochs for training
-    SNAPSHOT_INTERVAL = 50
+    SNAPSHOT_INTERVAL = 5
     NUM_EXAMPLES = 6  # number of examples to visualize
     
     # Conditioning Augmentation parameters as in paper
@@ -68,7 +67,7 @@ class Config:
     LAMBDA = 2.0   # paper value
     
     # Metrics parameters
-    EVAL_INTERVAL = 1
+    EVAL_INTERVAL = 10
     FID_SAMPLE_SIZE = 500
     INCEPTION_SAMPLE_SIZE = 500
     R_PRECISION_K = 5
@@ -104,7 +103,7 @@ class GANMetrics:
         
         # Model for feature extraction (FID) - with progress indication
         print("  - Loading feature extraction model...")
-        self.inception_model = models.inception_v3(weights=torchvision.models.Inception_V3_Weights.DEFAULT)
+        self.inception_model = models.inception_v3(pretrained=True, progress=True)
         self.inception_model.fc = nn.Identity()  # Remove classification layer
         self.inception_model.eval()
         self.inception_model = self.inception_model.to(self.device)
@@ -222,49 +221,23 @@ class GANMetrics:
         
         return is_mean, is_std
     
-    def calculate_r_precision(self, image_data, text_embeddings, k=5):
+    def calculate_r_precision(self, image_embeddings, text_embeddings, k=5):
         """Calculate R-precision for text-image matching"""
         print("Calculating R-precision...")
-        
-        # First extract image features using the inception model
-        if self.inception_model is None:
-            self._load_inception_models()
-        
-        # Convert data to appropriate format
-        if isinstance(image_data, torch.Tensor):
-            image_data = image_data.to(self.device)
-        else:
-            image_data = torch.tensor(image_data).to(self.device)
-            
+        # Convert to NumPy arrays if they are torch tensors
+        if isinstance(image_embeddings, torch.Tensor):
+            image_embeddings = image_embeddings.cpu().numpy()
         if isinstance(text_embeddings, torch.Tensor):
             text_embeddings = text_embeddings.cpu().numpy()
-        
-        # Extract features from images using inception model
-        image_features = self._get_activations(image_data, self.inception_model).cpu().numpy()
-        
-        # Project text embeddings to match inception feature dimensions (10240 → 2048)
-        from sklearn.decomposition import PCA
-        
-        # Get dimensions
-        n_samples = len(text_embeddings)
-        feature_dim = image_features.shape[1]  # This should be 2048 for InceptionV3
-        
-        # Use a simple linear projection with matrix multiplication instead of PCA
-        # First create a random but consistent projection matrix
-        np.random.seed(42)  # For consistency between runs
-        projection_matrix = np.random.randn(text_embeddings.shape[1], feature_dim) / np.sqrt(feature_dim)
-        
-        # Project the text embeddings to match image feature dimensions
-        text_embeddings_reduced = np.matmul(text_embeddings, projection_matrix)
-        
+            
         # Normalize embeddings for cosine similarity
-        image_norm = np.linalg.norm(image_features, axis=1, keepdims=True)
-        text_norm = np.linalg.norm(text_embeddings_reduced, axis=1, keepdims=True) 
-        image_features = image_features / (image_norm + 1e-8)
-        text_embeddings_reduced = text_embeddings_reduced / (text_norm + 1e-8)
+        image_norm = np.linalg.norm(image_embeddings, axis=1, keepdims=True)
+        text_norm = np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+        image_embeddings = image_embeddings / (image_norm + 1e-8)
+        text_embeddings = text_embeddings / (text_norm + 1e-8)
         
         # Calculate similarity matrix
-        similarity = np.matmul(image_features, text_embeddings_reduced.T)
+        similarity = np.matmul(image_embeddings, text_embeddings.T)
         
         # Calculate R-precision
         r_precision = 0.0
@@ -757,7 +730,7 @@ class GANTrainer:
         os.makedirs(self.log_dir, exist_ok=True)
         
         print("Trainer initialization complete")
-    
+        
     def train_discriminator(self, real_images, embeddings, noise):
         """Train the discriminator for one step using binary cross-entropy loss as in original GAN paper"""
         self.d_optimizer.zero_grad()
@@ -831,9 +804,9 @@ class GANTrainer:
             plt.close()
         self.generator.train()
     
-    def compute_metrics(self, epoch, real_images, text_embeddings, num_samples=500, is_validation=False):
+    def compute_metrics(self, epoch, real_images, text_embeddings, num_samples=500):
         """Compute evaluation metrics"""
-        phase = "validation" if is_validation else "training"
+        print(f"\nComputing metrics for epoch {epoch}...")
         
         # Generate fake images for metrics calculation
         self.generator.eval()
@@ -849,41 +822,34 @@ class GANTrainer:
             fake_images = fake_images.cpu()
             real_images_sample = real_images[:num_samples].cpu()
             
-            # Initialize metrics values
-            fid_score = float('inf')
-            is_mean = 0.0
-            r_precision = 0.0
-            
-            # Calculate FID score and Inception Score only for validation
-            if is_validation:
-                try:
-                    fid_score = self.metrics_calculator.calculate_fid(real_images_sample, fake_images)
-                    self.metrics['fid_scores'].append(fid_score)
-                except Exception as e:
-                    print(f"Error calculating FID score: {e}")
-                
-                try:
-                    is_mean, is_std = self.metrics_calculator.calculate_inception_score(fake_images)
-                    self.metrics['inception_scores'].append(is_mean)
-                except Exception as e:
-                    print(f"Error calculating Inception Score: {e}")
-            
-            # Calculate R-precision for both training and validation
+            # Calculate FID score
             try:
-                # Calculate R-precision
+                fid_score = self.metrics_calculator.calculate_fid(real_images_sample, fake_images)
+                self.metrics['fid_scores'].append(fid_score)
+                print(f"FID Score: {fid_score:.4f}")
+            except Exception as e:
+                print(f"Error calculating FID score: {e}")
+            
+            # Calculate Inception Score
+            try:
+                is_mean, is_std = self.metrics_calculator.calculate_inception_score(fake_images)
+                self.metrics['inception_scores'].append(is_mean)
+                print(f"Inception Score: {is_mean:.4f} ± {is_std:.4f}")
+            except Exception as e:
+                print(f"Error calculating Inception Score: {e}")
+            
+            # Calculate R-precision
+            try:
+                # Get feature embeddings of generated images
                 r_precision = self.metrics_calculator.calculate_r_precision(
                     fake_images.detach().cpu().numpy(),
                     text_embeddings[:num_samples].cpu().numpy(),
                     k=self.config.R_PRECISION_K
                 )
-                if is_validation:
-                    self.metrics['r_precision'].append(r_precision)
+                self.metrics['r_precision'].append(r_precision)
+                print(f"R-precision: {r_precision:.4f}")
             except Exception as e:
                 print(f"Error calculating R-precision: {e}")
-            
-            # Print metrics in the requested format for validation
-            if is_validation:
-                print(f"Epoch {epoch} (validation) : Inception Score: {is_mean:.4f}, FID: {fid_score:.4f}, R-squared-precision: {r_precision:.4f}")
         
         self.generator.train()
     
@@ -924,70 +890,6 @@ class GANTrainer:
         with open(os.path.join(self.metrics_dir, 'metrics.pkl'), 'wb') as f:
             pickle.dump(self.metrics, f)
 
-    def save_checkpoint(self, epoch, global_step=0, is_best=False):
-        """Save comprehensive checkpoint for resuming training"""
-        checkpoint_dir = os.path.join('checkpoints', self.config.DATASET_NAME)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        checkpoint = {
-            'epoch': epoch,
-            'global_step': global_step,
-            'generator_state': self.generator.state_dict(),
-            'discriminator_state': self.discriminator.state_dict(),
-            'g_optimizer_state': self.g_optimizer.state_dict(),
-            'd_optimizer_state': self.d_optimizer.state_dict(),
-            'metrics': self.metrics,
-            'fixed_noise': self.fixed_noise,
-            'timestamp': time.time()
-        }
-        
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint at epoch {epoch} to {checkpoint_path}")
-        
-        # Save latest checkpoint (for resuming)
-        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
-        torch.save(checkpoint, latest_path)
-        
-        # Save best model if this is the best one
-        if is_best:
-            best_path = os.path.join(checkpoint_dir, 'best_model.pt')
-            torch.save(checkpoint, best_path)
-            print(f"Saved best model checkpoint to {best_path}")
-            
-    def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint to resume training"""
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint not found at {checkpoint_path}")
-            return False
-            
-        try:
-            print(f"Loading checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Load model states
-            self.generator.load_state_dict(checkpoint['generator_state'])
-            self.discriminator.load_state_dict(checkpoint['discriminator_state'])
-            
-            # Load optimizer states
-            self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
-            self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
-            
-            # Load metrics history
-            self.metrics = checkpoint['metrics']
-            
-            # Load fixed noise for continuity in visualization
-            if 'fixed_noise' in checkpoint:
-                self.fixed_noise = checkpoint['fixed_noise']
-            
-            # Return the epoch and step to resume from
-            return checkpoint['epoch'], checkpoint.get('global_step', 0)
-            
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            return False
-
 def save_model(model, path):
     """Save model weights"""
     torch.save(model.state_dict(), path)
@@ -996,12 +898,15 @@ def load_model(model, path):
     """Load model weights"""
     model.load_state_dict(torch.load(path, map_location=model.device))
 
-def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
-    """Training function for Stage-I GAN with checkpoint support"""
+
+def train(config, num_epochs=10, skip_metrics=False):
     print(f"Training on device: {config.DEVICE}")
     
     # Create data manager
     data_manager = DataManager(config)
+    
+    # Visualize some samples
+    data_manager.visualize_samples(num_samples=3)
     
     # Get training and validation data loaders
     train_loader, train_size = data_manager.get_data()
@@ -1012,21 +917,6 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
     
     # Create trainer
     trainer = GANTrainer(config)
-    
-    # Initialize tracking variables
-    start_epoch = 0
-    global_step = 0
-    
-    # Resume from checkpoint if specified
-    if resume_checkpoint:
-        resume_result = trainer.load_checkpoint(resume_checkpoint)
-        if resume_result:
-            start_epoch, global_step = resume_result
-            print(f"Resuming from epoch {start_epoch+1}, global step {global_step}")
-    
-    # Visualize samples only if starting fresh
-    if start_epoch == 0:
-        data_manager.visualize_samples(num_samples=3)
     
     # Get fixed embeddings for visualization
     fixed_embeddings = None
@@ -1045,7 +935,7 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
     print(f"Steps per epoch: {steps_per_epoch}")
     
     print("\n======= Starting training =======\n")
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(num_epochs):
         epoch_start_time = time.time()
         print(f"\n===== EPOCH {epoch+1}/{num_epochs} =====")
         
@@ -1058,8 +948,6 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
         kl_losses = []
         
         for step, (real_images, embeddings) in enumerate(train_loader):
-            global_step += 1
-            
             # Move data to device
             real_images = real_images.to(config.DEVICE)
             embeddings = embeddings.to(config.DEVICE)
@@ -1078,7 +966,9 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
             kl_losses.append(kl_loss)
             
             # Print progress
-            
+            if (step + 1) % 10 == 0:
+                print(f"  Step {step+1}/{steps_per_epoch}, "
+                      f"G Loss: {g_loss:.4f}, D Loss: {d_loss:.4f}, KL Loss: {kl_loss:.4f}")
         
         # Calculate epoch average losses
         g_loss_avg = np.mean(g_losses)
@@ -1090,22 +980,10 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
         trainer.metrics['d_losses'].append(d_loss_avg)
         trainer.metrics['kl_losses'].append(kl_loss_avg)
         
-        # Print epoch training summary in the requested format
-        print(f"Epoch {epoch+1} (training) : Gen loss: {g_loss_avg:.4f}, disc loss: {d_loss_avg:.4f}, KL: {kl_loss_avg:.4f}")
-        
         # Compute evaluation metrics periodically if not skipped
         if not skip_metrics and (epoch + 1) % config.EVAL_INTERVAL == 0:
-            # Get validation samples
-            val_real_images = None
-            val_text_embeddings = None
-            for val_real_imgs, val_embeddings in val_loader:
-                val_real_images = val_real_imgs
-                val_text_embeddings = val_embeddings
-                break
-                
-            trainer.compute_metrics(epoch + 1, val_real_images, val_text_embeddings, 
-                                  num_samples=min(500, len(val_real_images)), 
-                                  is_validation=True)
+            trainer.compute_metrics(epoch + 1, real_images_sample, text_embeddings_sample, 
+                                   num_samples=min(500, len(real_images_sample)))
         
         # Save generated samples
         trainer.save_samples(epoch, fixed_embeddings)
@@ -1113,15 +991,13 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
         # Plot metrics
         trainer.plot_metrics(epoch)
         
-        # Determine if this is the best model based on FID score (lower is better)
-        is_best = False
-        if len(trainer.metrics['fid_scores']) > 0:
-            current_fid = trainer.metrics['fid_scores'][-1]
-            if len(trainer.metrics['fid_scores']) == 1 or current_fid < min(trainer.metrics['fid_scores'][:-1]):
-                is_best = True
-                
-        # Save checkpoint
-        trainer.save_checkpoint(epoch + 1, global_step, is_best)
+        # Save model checkpoint
+        if (epoch + 1) % config.SNAPSHOT_INTERVAL == 0 or epoch == num_epochs - 1:
+            save_model(trainer.generator, 
+                      os.path.join(trainer.checkpoint_dir, f'generator_epoch_{epoch+1}.pt'))
+            save_model(trainer.discriminator, 
+                      os.path.join(trainer.checkpoint_dir, f'discriminator_epoch_{epoch+1}.pt'))
+            print(f"Saved model checkpoint at epoch {epoch+1}")
         
         # Print epoch summary
         epoch_time = time.time() - epoch_start_time
@@ -1133,24 +1009,15 @@ def train(config, num_epochs=10, skip_metrics=False, resume_checkpoint=None):
     # Final evaluation if not skipped
     if not skip_metrics:
         print("\n======= Final Evaluation =======\n")
-        # Get validation samples
-        val_real_images = None
-        val_text_embeddings = None
-        for val_real_imgs, val_embeddings in val_loader:
-            val_real_images = val_real_imgs
-            val_text_embeddings = val_embeddings
-            break
-            
-        trainer.compute_metrics(num_epochs, val_real_images, val_text_embeddings, 
-                              num_samples=min(1000, len(val_real_images)),
-                              is_validation=True)
+        trainer.compute_metrics(num_epochs, real_images_sample, text_embeddings_sample, 
+                               num_samples=min(1000, len(real_images_sample)))
 
 def main():
-    # Set your dataset paths here - FIXED THE DIRECTORY ASSIGNMENTS
+    # Set your dataset paths here
     images_path = "images"  # Directory containing bird class folders with images
-    train_path = "train"    # Correctly using train data for training
-    test_path = "test"      # Correctly using test data for validation
-    
+    train_path = "test"    # Directory with training data embeddings
+    test_path = "train"      # Directory with test data embeddings
+
     config = Config(images_path, train_path, test_path)
     
     # Print key configuration values for verification
@@ -1161,41 +1028,15 @@ def main():
     print(f"Learning rate: {config.STAGE1_G_LR} (as per paper)")
     print(f"Image size: {config.STAGE1_IMAGE_SIZE}x{config.STAGE1_IMAGE_SIZE} (as per paper)")
     
-    # Add checkpoint support for resuming interrupted training
-    checkpoint_dir = os.path.join('checkpoints', config.DATASET_NAME)
-    resume_checkpoint = None
-    
-    if os.path.exists(checkpoint_dir):
-        # Check for latest checkpoint
-        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
-        if os.path.exists(latest_path):
-            user_input = input(f"Found latest checkpoint at {latest_path}. Resume training? (y/n): ")
-            if user_input.lower() == 'y':
-                resume_checkpoint = latest_path
-        else:
-            # Find checkpoint with highest epoch number
-            checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_')]
-            if checkpoints:
-                # Sort by epoch number
-                checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                latest_checkpoint = os.path.join(checkpoint_dir, checkpoints[-1])
-                
-                user_input = input(f"Found checkpoint {latest_checkpoint}. Resume training? (y/n): ")
-                if user_input.lower() == 'y':
-                    resume_checkpoint = latest_checkpoint
-    
-    # Use the exact batch size from the paper
+    # Use the exact batch size from the paper without automatic adjustment
     if torch.cuda.is_available():
         print(f"Training on GPU: {torch.cuda.get_device_name(0)}")
     
-    # Train with proper dataset configuration
-    train(config, num_epochs=config.EPOCHS, skip_metrics=False, resume_checkpoint=resume_checkpoint)
+    # Adding skip_metrics=True to avoid inception model loading during initial testing
+    train(config, num_epochs=5, skip_metrics=True)  # Start with a small number for testing
 
 if __name__ == "__main__":
     # This is the important fix for the multiprocessing issue
     import multiprocessing
     multiprocessing.freeze_support()
     main()
-
-
-
