@@ -1,25 +1,50 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 class ResidualBlock(nn.Module):
-    """Residual block used in Stage-II Generator as specified in StackGAN paper"""
+    """Enhanced residual block with spectral normalization for stability"""
     def __init__(self, channel_num):
         super(ResidualBlock, self).__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(channel_num, channel_num, kernel_size=3, stride=1, padding=1, bias=False),
+            spectral_norm(nn.Conv2d(channel_num, channel_num, kernel_size=3, stride=1, padding=1, bias=False)),
             nn.BatchNorm2d(channel_num),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel_num, channel_num, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(channel_num, channel_num, kernel_size=3, stride=1, padding=1, bias=False)),
             nn.BatchNorm2d(channel_num)
         )
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
         residual = x
         out = self.block(x)
         out += residual
         out = self.relu(out)
+        return out
+
+# Self-Attention module for better spatial coherence
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim):
+        super(SelfAttention, self).__init__()
+        self.query_conv = spectral_norm(nn.Conv2d(in_dim, in_dim//8, kernel_size=1))
+        self.key_conv = spectral_norm(nn.Conv2d(in_dim, in_dim//8, kernel_size=1))
+        self.value_conv = spectral_norm(nn.Conv2d(in_dim, in_dim, kernel_size=1))
+        self.gamma = nn.Parameter(torch.zeros(1))  # learnable parameter
+        
+    def forward(self, x):
+        batch_size, C, width, height = x.size()
+        
+        proj_query = self.query_conv(x).view(batch_size, -1, width*height).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(batch_size, -1, width*height)
+        energy = torch.bmm(proj_query, proj_key)  # batch matrix-matrix product
+        attention = F.softmax(energy, dim=-1)
+        
+        proj_value = self.value_conv(x).view(batch_size, -1, width*height)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, width, height)
+        
+        out = self.gamma * out + x
         return out
 
 class ConditioningAugmentation(nn.Module):
@@ -38,9 +63,8 @@ class ConditioningAugmentation(nn.Module):
         mu = x[:, :self.output_dim]
         logvar = x[:, self.output_dim:]
         
-        # Calculate KL divergence
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_loss = kl_loss / mu.size(0)  # normalize by batch size
+        # Calculate KL divergence with numerical stability improvements
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp() + 1e-8)
         
         # Reparameterization trick
         std = torch.exp(0.5 * logvar)
@@ -84,35 +108,36 @@ class StageIIGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Residual blocks as described in paper (typically 1-4 blocks)
+        # Residual blocks with more expressive capacity
         self.residual = nn.Sequential(
             ResidualBlock(ngf * 4),
             ResidualBlock(ngf * 4),
+            SelfAttention(ngf * 4),  # Add self-attention after two residual blocks
             ResidualBlock(ngf * 4),
             ResidualBlock(ngf * 4)
         )
         
-        # Upsampling layers: 16x16 -> 256x256 (exactly as described in paper)
+        # Use spectral norm in upsampling layers for stability
         self.upsample1 = nn.Sequential(
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),  # 16x16 -> 32x32
+            spectral_norm(nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False)),
             nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(inplace=True)
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
         self.upsample2 = nn.Sequential(
-            nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=4, stride=2, padding=1, bias=False),  # 32x32 -> 64x64
+            spectral_norm(nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=4, stride=2, padding=1, bias=False)),  # 32x32 -> 64x64
             nn.BatchNorm2d(ngf),
-            nn.ReLU(inplace=True)
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
         self.upsample3 = nn.Sequential(
-            nn.ConvTranspose2d(ngf, ngf // 2, kernel_size=4, stride=2, padding=1, bias=False),  # 64x64 -> 128x128
+            spectral_norm(nn.ConvTranspose2d(ngf, ngf // 2, kernel_size=4, stride=2, padding=1, bias=False)),  # 64x64 -> 128x128
             nn.BatchNorm2d(ngf // 2),
-            nn.ReLU(inplace=True)
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
         self.upsample4 = nn.Sequential(
-            nn.ConvTranspose2d(ngf // 2, 3, kernel_size=4, stride=2, padding=1, bias=False),  # 128x128 -> 256x256
+            spectral_norm(nn.ConvTranspose2d(ngf // 2, 3, kernel_size=4, stride=2, padding=1, bias=False)),  # 128x128 -> 256x256
             nn.Tanh()
         )
         
@@ -159,33 +184,39 @@ class StageIIDiscriminator(nn.Module):
         # Image encoder: extract image features (256x256 -> 4x4) as specified in paper
         self.img_encoder = nn.Sequential(
             # 256x256 -> 128x128
-            nn.Conv2d(3, ndf, kernel_size=4, stride=2, padding=1, bias=False),
+            spectral_norm(nn.Conv2d(3, ndf, kernel_size=4, stride=2, padding=1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 128x128 -> 64x64
-            nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
+            spectral_norm(nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.InstanceNorm2d(ndf * 2),  # Instance norm instead of batch norm
             nn.LeakyReLU(0.2, inplace=True),
             
             # 64x64 -> 32x32
-            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.InstanceNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
             
+            # Add self-attention at ndf*4 (earlier in the network where channels match)
+            SelfAttention(ndf * 4),
+            
             # 32x32 -> 16x16
-            nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 8),
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.InstanceNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 16x16 -> 8x8
-            nn.Conv2d(ndf * 8, ndf * 16, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 16),
+            spectral_norm(nn.Conv2d(ndf * 8, ndf * 16, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.InstanceNorm2d(ndf * 16),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 8x8 -> 4x4
-            nn.Conv2d(ndf * 16, ndf * 32, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 32),
-            nn.LeakyReLU(0.2, inplace=True)
+            spectral_norm(nn.Conv2d(ndf * 16, ndf * 32, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.InstanceNorm2d(ndf * 32),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Remove the incorrectly placed self-attention that was causing the error
+            # SelfAttention(ndf * 8),  # This was causing the error due to dimension mismatch
         )
         
         # Text embedding encoder

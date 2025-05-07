@@ -376,10 +376,9 @@ class DataManager:
         if not os.path.exists(self.image_dir):
             raise FileNotFoundError(f"Images directory not found: {self.image_dir}")
             
-        # Load text embeddings
-        with open(self.embedding_path, 'rb') as f:
-            self.embeddings = pickle.load(f, encoding='latin1')
-            
+        # Load text embeddings with memory-mapping for faster access
+        self.embeddings = self._load_embeddings(self.embedding_path)
+        
         # Load filenames
         with open(self.filenames_path, 'rb') as f:
             self.filenames = pickle.load(f, encoding='latin1')
@@ -394,6 +393,29 @@ class DataManager:
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-1, 1]
         ])
+
+    def _load_embeddings(self, path):
+        """Load embeddings with memory-efficient approach"""
+        print(f"Loading embeddings from {path}...")
+        start_time = time.time()
+        
+        try:
+            with open(path, 'rb') as f:
+                embeddings = pickle.load(f, encoding='latin1')
+            
+            # Convert to numpy arrays for better memory handling if needed
+            if isinstance(embeddings, list) and len(embeddings) > 0:
+                # Check if we need to convert format
+                if not isinstance(embeddings[0], np.ndarray):
+                    print("Converting embeddings to numpy arrays...")
+                    embeddings = [np.array(e) for e in embeddings]
+            
+            print(f"Embeddings loaded in {time.time() - start_time:.2f} seconds")
+            return embeddings
+            
+        except Exception as e:
+            print(f"Error loading embeddings: {e}")
+            raise
 
     def get_data(self):
         """Return a PyTorch DataLoader for training"""

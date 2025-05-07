@@ -85,7 +85,7 @@ def main():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-1, 1]
     ])
     
-    # Create Stage-II dataloader with high-res images
+    # Create Stage-II dataset with higher resolution - REVERTED TO ORIGINAL VERSION
     from torch.utils.data import DataLoader
     from stage1 import BirdsDataset
     
@@ -98,20 +98,53 @@ def main():
         stage2_transform
     )
     
-    # Create DataLoader
+    # Create DataLoader with original settings
     train_stage2_loader = DataLoader(
         train_stage2_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
-        num_workers=4,  # Increase from 4 to 8
-        pin_memory=True,
-        prefetch_factor=2,  # Add prefetching 
-        persistent_workers=True,  # Keep workers alive between epochs
-        drop_last=True
+        num_workers=4,  # Back to original setting
+        pin_memory=True if config.DEVICE.type == 'cuda' else False,
+        drop_last=True,
+        prefetch_factor=2
     )
     
+    # Add auto-resume capability if no specific checkpoint is provided
+    if args.resume is None:
+        checkpoint_dir = os.path.join('checkpoints', config.DATASET_NAME, 'stage2')
+        
+        # First check if there's a latest checkpoint
+        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.exists(latest_path):
+            args.resume = 'latest_checkpoint.pt'
+            print("Auto-detected latest checkpoint. Will resume from there.")
+            
+        # If latest doesn't exist, look for the highest epoch checkpoint
+        else:
+            # Find all checkpoint files
+            checkpoints = [f for f in os.listdir(checkpoint_dir) 
+                          if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+            
+            if checkpoints:
+                # Extract epoch numbers
+                epochs = [int(f.split('_')[-1].split('.')[0]) for f in checkpoints]
+                # Find the highest epoch
+                latest_idx = np.argmax(epochs)
+                latest_epoch = epochs[latest_idx]
+                args.resume = f'checkpoint_epoch_{latest_epoch}.pt'
+                print(f"Auto-detected checkpoint at epoch {latest_epoch}. Will resume from there.")
+    
+    # Add explicit epoch loading option
+    if args.resume and args.resume.isdigit():
+        # If user just passed a number, construct the full checkpoint filename
+        epoch_num = args.resume
+        args.resume = f'checkpoint_epoch_{epoch_num}.pt'
+        print(f"Will attempt to load checkpoint from epoch {epoch_num}")
+    
     # Start training Stage-II GAN
-    train_stage2_gan(config, train_stage1_loader, train_stage2_loader, resume_checkpoint=args.resume, stage1_checkpoint=args.stage1_checkpoint)
+    train_stage2_gan(config, train_stage1_loader, train_stage2_loader, 
+                    resume_checkpoint=args.resume, 
+                    stage1_checkpoint=args.stage1_checkpoint)
 
 if __name__ == "__main__":
     

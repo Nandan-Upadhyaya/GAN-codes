@@ -16,8 +16,34 @@ import matplotlib
 from stage2_models import StageIIGenerator, StageIIDiscriminator
 from stage1 import StageIGenerator, Config, GANMetrics
 
-
+# Add gradient penalty for WGAN-GP style stabilization
+def compute_gradient_penalty(discriminator, real_samples, fake_samples, embeddings, device):
+    """Compute gradient penalty for improved WGAN training stability"""
+    # Interpolation between real and fake samples
+    alpha = torch.rand((real_samples.size(0), 1, 1, 1), device=device)
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
     
+    # Calculate discriminator output for interpolated images
+    d_interpolates = discriminator([interpolates, embeddings])
+    
+    # Create labels for gradient computation
+    fake_outputs = torch.ones(real_samples.size(0), device=device, requires_grad=False)
+    
+    # Get gradients w.r.t. interpolates
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    
+    # Calculate gradient penalty
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
 class Stage2Trainer:
     def __init__(self, config, stage1_checkpoint=None):
         self.config = config
@@ -40,16 +66,26 @@ class Stage2Trainer:
         self.generator = StageIIGenerator(config).to(self.device)
         self.discriminator = StageIIDiscriminator(config).to(self.device)
         
-        # Initialize optimizers as in paper (Adam with beta1=0.5, beta2=0.999)
+        # Enhanced optimizers with appropriate betas for WGAN-style training
         self.g_optimizer = optim.Adam(
             self.generator.parameters(),
             lr=config.STAGE2_G_LR,
-            betas=(config.BETA1, config.BETA2)
+            betas=(0.5, 0.999)
         )
         self.d_optimizer = optim.Adam(
             self.discriminator.parameters(),
             lr=config.STAGE2_D_LR,
-            betas=(config.BETA1, config.BETA2)
+            betas=(0.5, 0.999)
+        )
+        
+        # Add learning rate schedulers
+        self.g_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.g_optimizer, mode='min', factor=0.5, patience=20,
+            min_lr=1e-6, verbose=True
+        )
+        self.d_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.d_optimizer, mode='min', factor=0.5, patience=20,
+            min_lr=1e-6, verbose=True
         )
         
         # Create fixed noise vector for visualization
@@ -120,35 +156,45 @@ class Stage2Trainer:
         print("Stage-I Generator loaded successfully")
     
     def train_discriminator(self, real_images, stage1_images, embeddings):
-        """Train the discriminator for one step using binary cross-entropy loss"""
+        """Improved discriminator training with gradient penalty and label smoothing"""
         self.d_optimizer.zero_grad()
         
         batch_size = real_images.size(0)
         
         # Generate high-resolution fake images
-        fake_images, _ = self.generator([stage1_images, embeddings])
+        with torch.no_grad():
+            fake_images, _ = self.generator([stage1_images, embeddings])
         
-        # Real images: label = 1
-        real_labels = torch.ones(batch_size, device=self.device)
+        # Real images: label smoothing (0.9 instead of 1.0)
+        real_labels = torch.ones(batch_size, device=self.device) * 0.9
         real_logits = self.discriminator([real_images, embeddings])
         d_loss_real = F.binary_cross_entropy(real_logits, real_labels)
         
-        # Fake images: label = 0
+        # Fake images
         fake_labels = torch.zeros(batch_size, device=self.device)
         fake_logits = self.discriminator([fake_images.detach(), embeddings])
         d_loss_fake = F.binary_cross_entropy(fake_logits, fake_labels)
         
+        # Gradient penalty
+        gp_weight = 10.0  # λ for gradient penalty
+        gp = compute_gradient_penalty(
+            self.discriminator, real_images, fake_images.detach(), 
+            embeddings, self.device
+        )
+        
         # Total discriminator loss
-        d_loss = d_loss_real + d_loss_fake
+        d_loss = d_loss_real + d_loss_fake + gp_weight * gp
         
         # Backpropagation and optimization
         d_loss.backward()
+        # Gradient clipping for stable training
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=5.0)
         self.d_optimizer.step()
         
-        return d_loss.item()
+        return d_loss.item(), gp.item()
     
     def train_generator(self, stage1_images, embeddings):
-        """Train the generator for one step using binary cross-entropy loss + KL divergence regularization"""
+        """Enhanced generator training with feature matching loss"""
         self.g_optimizer.zero_grad()
         
         batch_size = embeddings.size(0)
@@ -156,16 +202,20 @@ class Stage2Trainer:
         # Generate high-resolution fake images
         fake_images, kl_loss = self.generator([stage1_images, embeddings])
         
-        # Compute generator loss - fool the discriminator
+        # Standard adversarial loss
         real_labels = torch.ones(batch_size, device=self.device)
         fake_logits = self.discriminator([fake_images, embeddings])
         g_loss = F.binary_cross_entropy(fake_logits, real_labels)
         
-        # Add KL divergence loss with lambda regularization as in paper
-        total_loss = g_loss + self.config.LAMBDA * kl_loss
+        # Add KL divergence loss with dynamic lambda weighting
+        # Gradually increase KL weight to prevent KL vanishing
+        kl_weight = min(2.0, 0.2 + self.current_epoch * 0.004)  # Linearly increase from 0.2 to 2.0
+        total_loss = g_loss + kl_weight * kl_loss
         
         # Backpropagation and optimization
         total_loss.backward()
+        # Gradient clipping for stable training
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=5.0)
         self.g_optimizer.step()
         
         return g_loss.item(), kl_loss.item()
@@ -280,20 +330,74 @@ class Stage2Trainer:
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint to resume training"""
         print(f"Loading checkpoint from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        full_path = checkpoint_path
         
-        # Load model states
-        self.generator.load_state_dict(checkpoint['generator_state'])
-        self.discriminator.load_state_dict(checkpoint['discriminator_state'])
+        # If checkpoint_path is just a filename, prepend the checkpoint directory
+        if not os.path.isabs(checkpoint_path) and not os.path.exists(checkpoint_path):
+            full_path = os.path.join(self.checkpoint_dir, checkpoint_path)
+            print(f"Using full path: {full_path}")
         
-        # Load optimizer states
-        self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
-        self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
-        
-        # Load metrics history and other tracking variables
-        self.metrics = checkpoint['metrics']
-        
-        return checkpoint['epoch']
+        if not os.path.exists(full_path):
+            print(f"ERROR: Checkpoint file {full_path} does not exist!")
+            print(f"Available checkpoints in {self.checkpoint_dir}:")
+            
+            try:
+                files = os.listdir(self.checkpoint_dir)
+                checkpoint_files = [f for f in files if f.endswith('.pt')]
+                for f in checkpoint_files:
+                    print(f"  - {f}")
+            except Exception as e:
+                print(f"Error listing checkpoint directory: {e}")
+                
+            print("Starting training from scratch.")
+            return 0
+            
+        try:
+            checkpoint = torch.load(full_path, map_location=self.device)
+            # Load model states with backward compatibility
+            try:
+                # Load generator state with strict=False to allow for architecture changes
+                self.generator.load_state_dict(checkpoint['generator_state'], strict=False)
+                missing_keys = set(self.generator.state_dict().keys()) - set(checkpoint['generator_state'].keys())
+                if missing_keys:
+                    print(f"Warning: Some generator keys were not found in checkpoint: {missing_keys}")
+                
+                # Load discriminator state with strict=False
+                self.discriminator.load_state_dict(checkpoint['discriminator_state'], strict=False)
+                missing_keys = set(self.discriminator.state_dict().keys()) - set(checkpoint['discriminator_state'].keys())
+                if missing_keys:
+                    print(f"Warning: Some discriminator keys were not found in checkpoint: {missing_keys}")
+                    
+                print("Model states loaded successfully")
+            except Exception as e:
+                print(f"Warning: Error loading model states: {e}")
+                print("This might be due to architecture changes. Trying to continue anyway...")
+            
+            # Load optimizer states
+            try:
+                self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
+                self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
+                print("Optimizer states loaded successfully")
+            except Exception as e:
+                print(f"Warning: Error loading optimizer states: {e}")
+                print("Continuing with freshly initialized optimizers")
+            
+            # Load metrics history
+            if 'metrics' in checkpoint:
+                self.metrics = checkpoint['metrics']
+                print("Training metrics history loaded")
+            
+            # Make sure current_epoch is set
+            self.current_epoch = checkpoint['epoch']
+            
+            return checkpoint['epoch']
+        except Exception as e:
+            print(f"Critical error loading checkpoint: {e}")
+            print(f"Full traceback:")
+            import traceback
+            traceback.print_exc()
+            print("Starting fresh training")
+            return 0
 
 def resize_images(images, target_size):
     """Resize a batch of images from Stage-I (64x64) to Stage-II input size (256x256)"""
@@ -315,6 +419,7 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
     
     # Create trainer with specified Stage-I checkpoint
     trainer = Stage2Trainer(config, stage1_checkpoint)
+    trainer.current_epoch = 0  # Track epoch for dynamic weight adjustments
     
     # Handle resume training
     start_epoch = 0
@@ -370,6 +475,7 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
     print("\n======= Starting Stage-II GAN Training =======\n")
     
     for epoch in range(start_epoch, total_epochs):
+        trainer.current_epoch = epoch  # Update current epoch for dynamic parameters
         epoch_start_time = time.time()
         
         # Initialize metrics
@@ -377,8 +483,24 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
         d_losses = []
         kl_losses = []
         
+        # Add batch processing time tracking
+        data_loading_time = 0
+        compute_time = 0
+        last_print_time = time.time()
+        
+        # Show progress indicators
+        print(f"Processing batches for epoch {epoch+1}...")
+        
         # Iterate through both Stage-I and Stage-II dataloaders together
-        for stage1_data, stage2_data in zip(stage1_loader, stage2_loader):
+        for batch_idx, (stage1_data, stage2_data) in enumerate(zip(stage1_loader, stage2_loader)):
+            # Mark data loading completion time
+            data_load_end_time = time.time()
+            
+            # Periodically print progress to show activity
+            if time.time() - last_print_time > 60:  # Print every minute
+                print(f"  Processing batch {batch_idx+1}... (still active)")
+                last_print_time = time.time()
+            
             # Get Stage-I data (we only need embeddings)
             _, stage1_embeddings = stage1_data
             stage1_embeddings = stage1_embeddings.to(config.DEVICE)
@@ -396,13 +518,25 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
                 stage1_fake_images, _ = trainer.stage1_generator(noise, stage1_embeddings)
             
             # Train discriminator
-            d_loss = trainer.train_discriminator(stage2_real_images, stage1_fake_images, stage2_embeddings)
+            d_loss, gp = trainer.train_discriminator(stage2_real_images, stage1_fake_images, stage2_embeddings)
             d_losses.append(d_loss)
             
             # Train generator
             g_loss, kl_loss = trainer.train_generator(stage1_fake_images, stage2_embeddings)
             g_losses.append(g_loss)
             kl_losses.append(kl_loss)
+            
+            # Track timing
+            compute_end_time = time.time()
+            data_loading_time += data_load_end_time - (compute_end_time - data_loading_time if batch_idx > 0 else epoch_start_time)
+            compute_time += compute_end_time - data_load_end_time
+        
+        # Print timing information
+        if len(g_losses) > 0:  # Only print if we processed at least one batch
+            print(f"\nData loading time: {data_loading_time:.2f}s, Compute time: {compute_time:.2f}s")
+            print(f"Data loading efficiency: {100 * compute_time / (compute_time + data_loading_time):.1f}%")
+        else:
+            print("\nWARNING: No batches were processed this epoch!")
         
         # Calculate epoch average losses
         g_loss_avg = np.mean(g_losses)
@@ -413,6 +547,10 @@ def train_stage2_gan(config, stage1_loader, stage2_loader, resume_checkpoint=Non
         trainer.metrics['g_losses'].append(g_loss_avg)
         trainer.metrics['d_losses'].append(d_loss_avg)
         trainer.metrics['kl_losses'].append(kl_loss_avg)
+        
+        # Update learning rates based on loss progression
+        trainer.g_scheduler.step(g_loss_avg)
+        trainer.d_scheduler.step(d_loss_avg)
         
         # Print training information
         print(f"Epoch {epoch+1} (training) : Gen loss: {g_loss_avg:.4f}, disc loss: {d_loss_avg:.4f}, KL: {kl_loss_avg:.4f}")
