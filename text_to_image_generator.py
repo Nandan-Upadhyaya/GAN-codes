@@ -15,7 +15,7 @@ import re
 
 # Import from stage1.py for consistent model definitions
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stage1 import StageIGenerator, Config
+from stage1_CUB import StageIGenerator, Config
 
 # Import char-CNN-RNN implementation
 from char_cnn_rnn.char_cnn_rnn import char_cnn_rnn, prepare_text

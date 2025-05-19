@@ -14,7 +14,7 @@ import torchvision
 import matplotlib
 
 from stage2_models import StageIIGenerator, StageIIDiscriminator
-from stage1 import StageIGenerator, Config, GANMetrics
+from stage1_CUB import StageIGenerator, Config, GANMetrics
 
 # Add gradient penalty for WGAN-GP style stabilization
 def compute_gradient_penalty(discriminator, real_samples, fake_samples, embeddings, device):

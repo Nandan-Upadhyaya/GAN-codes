@@ -10,7 +10,7 @@ import sys
 
 import torchvision
 
-from stage1 import Config, DataManager
+from stage1_CUB import Config, DataManager
 from stage2_trainer import train_stage2_gan
 
 def parse_args():
@@ -87,7 +87,7 @@ def main():
     
     # Create Stage-II dataset with higher resolution - REVERTED TO ORIGINAL VERSION
     from torch.utils.data import DataLoader
-    from stage1 import BirdsDataset
+    from stage1_CUB import BirdsDataset
     
     # Create Stage-II dataset with higher resolution
     train_stage2_dataset = BirdsDataset(
