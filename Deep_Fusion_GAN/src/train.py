@@ -18,16 +18,22 @@ def train() -> Tuple[List[float], List[float], List[float]]:
     os.makedirs(gen_path_save, exist_ok=True)
 
     train_loader = create_loader(256, 24, data_path, "train")
+    # Create test loader for evaluation metrics
+    test_loader = create_loader(256, 24, data_path, "test")
+    print(f"Test set size: {len(test_loader.dataset)} images")
+    
     model = DeepFusionGAN(n_words=train_loader.dataset.n_words,
                           encoder_weights_path=encoder_weights_path,
                           image_save_path=image_save_path,
                           gen_path_save=gen_path_save)
+    
+    # Add this line - pass the vocabulary mapping to the model
     model.ixtoword = train_loader.dataset.code2word
 
     # Explicitly load from epoch 2 (checkpoint_epoch_1.pt)
-    checkpoint_path = os.path.join(gen_path_save, "checkpoint_epoch_2.pt")
+    checkpoint_path = os.path.join(gen_path_save, "checkpoint_epoch_9.pt")
     if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from epoch 2: {checkpoint_path}")
+        print(f"Loading checkpoint from epoch 9: {checkpoint_path}")
         start_epoch, g_losses_epoch, d_losses_epoch, d_gp_losses_epoch, is_scores_epoch, fid_scores_epoch, txtimg_losses_epoch = model.load_from_checkpoint(checkpoint_path)
     else:
         print(f"Warning: Checkpoint {checkpoint_path} not found. Starting from scratch.")
@@ -35,9 +41,10 @@ def train() -> Tuple[List[float], List[float], List[float]]:
         g_losses_epoch, d_losses_epoch, d_gp_losses_epoch = [], [], []
         is_scores_epoch, fid_scores_epoch, txtimg_losses_epoch = [], [], []
 
-    # Pass loaded metrics and start_epoch to fit
+    # Pass loaded metrics, start_epoch, and test_loader to fit
     g_losses, d_losses, d_gp_losses, is_scores, fid_scores, txtimg_losses = model.fit(
         train_loader,
+        test_loader=test_loader,  # Pass test loader for metrics
         num_epochs=600,
         start_epoch=start_epoch,
         g_losses_epoch=g_losses_epoch,

@@ -132,7 +132,7 @@ class DeepFusionGAN:
         # Return the data needed for continuing training
         return checkpoint['epoch'], g_losses, d_losses, d_gp_losses, is_scores, fid_scores, txtimg_losses
 
-    def fit(self, train_loader: DataLoader, num_epochs: int = 600, start_epoch: int = 0,
+    def fit(self, train_loader: DataLoader, test_loader: DataLoader = None, num_epochs: int = 600, start_epoch: int = 0,
             g_losses_epoch=None, d_losses_epoch=None, d_gp_losses_epoch=None,
             is_scores_epoch=None, fid_scores_epoch=None, txtimg_losses_epoch=None,
             auto_resume: bool = True):
@@ -235,25 +235,47 @@ class DeepFusionGAN:
             d_gp_losses_epoch.append(np.mean(d_gp_losses))
             txtimg_losses_epoch.append(np.mean(txtimg_losses))
 
-            # Compute IS and FID for validation set (or train set if no val loader)
+            # Compute IS and FID on test data instead of training data
             with torch.no_grad():
+                # Use test_loader if provided, otherwise fall back to train_loader
+                eval_loader = test_loader if test_loader is not None else train_loader
+                
+                print(f"Computing metrics on {'test' if test_loader is not None else 'training'} set")
+                
                 # Collect real and fake images for metrics (sample up to 512 for speed)
                 real_imgs_metric, fake_imgs_metric = [], []
-                for i, batch in enumerate(train_loader):
-                    if i >= 32: break  # 32*16=512 images if batch size 16
+                captions_for_metrics = []
+                cap_lens_for_metrics = []
+                
+                for i, batch in enumerate(eval_loader):
+                    if i >= 32: break  # 32*24=768 images if batch size 24
                     images, captions, captions_len, _ = prepare_data(batch, self.device)
+                    captions_for_metrics.append(captions)
+                    cap_lens_for_metrics.append(captions_len)
+                    
+                    # Get text embeddings
                     sentence_embeds = self.text_encoder(captions, captions_len).detach()
+                    
+                    # Generate images using the same text prompts
                     noise = torch.randn(images.size(0), 100).to(self.device)
-                    with torch.cuda.amp.autocast():
-                        fake_images = self.generator(noise, sentence_embeds)
+                    fake_images = self.generator(noise, sentence_embeds)
+                    
+                    # Store real and fake images
                     real_imgs_metric.append(images.cpu())
                     fake_imgs_metric.append(fake_images.cpu())
+                
                 real_imgs_metric = torch.cat(real_imgs_metric, dim=0)
                 fake_imgs_metric = torch.cat(fake_imgs_metric, dim=0)
-                # Replace with your actual IS/FID computation functions
+                
+                # Compute metrics
                 is_score, fid_score = 0.0, 0.0
                 if hasattr(self, "compute_is_fid"):
-                    is_score, fid_score = self.compute_is_fid(fake_imgs_metric, real_imgs_metric)
+                    try:
+                        is_score, fid_score = self.compute_is_fid(fake_imgs_metric, real_imgs_metric)
+                        print(f"Computed IS: {is_score:.4f}, FID: {fid_score:.4f}")
+                    except Exception as e:
+                        print(f"Error computing metrics: {e}")
+                
                 is_scores_epoch.append(is_score)
                 fid_scores_epoch.append(fid_score)
 

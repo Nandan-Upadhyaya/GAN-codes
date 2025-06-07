@@ -9,3 +9,19 @@ Papers sample.png
 CUB/
 Oxford102/
 debug_gan.log
+samples_custom-1/
+samples_custom-2/
+custom_checkpoints-1/
+custom_checkpoints-2/
+training_history.json
+custom_model.log
+stackgan_stage1_ckpt/
+Stage-1 samples/
+stackgan_stage2_ckpt/
+gen_weights/
+gen_images/
+text_encoder_weights/
+test_metrics_log.csv
+metrics_log.csv
+__pycache__/
+.vscode/
