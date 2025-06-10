@@ -25,3 +25,4 @@ test_metrics_log.csv
 metrics_log.csv
 __pycache__/
 .vscode/
+testing_images/

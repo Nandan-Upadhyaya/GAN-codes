@@ -30,10 +30,10 @@ def train() -> Tuple[List[float], List[float], List[float]]:
     # Add this line - pass the vocabulary mapping to the model
     model.ixtoword = train_loader.dataset.code2word
 
-    # Explicitly load from epoch 2 (checkpoint_epoch_1.pt)
-    checkpoint_path = os.path.join(gen_path_save, "checkpoint_epoch_9.pt")
+    # Explicitly load from the latest checkpoint.pt (after every epoch)
+    checkpoint_path = os.path.join(gen_path_save, "checkpoint.pt")
     if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from epoch 9: {checkpoint_path}")
+        print(f"Loading checkpoint from latest: {checkpoint_path}")
         start_epoch, g_losses_epoch, d_losses_epoch, d_gp_losses_epoch, is_scores_epoch, fid_scores_epoch, txtimg_losses_epoch = model.load_from_checkpoint(checkpoint_path)
     else:
         print(f"Warning: Checkpoint {checkpoint_path} not found. Starting from scratch.")
